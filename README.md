@@ -156,7 +156,7 @@ python -m train.train --data_dir dataset --vocab_path vocab.json --out_dir check
 ### 3. Generate
 
 ```cmd
-python -m generate.generate --checkpoint checkpoints\latest.pt --vocab_path vocab.json --out_dir generated --n_samples 5 --length 512 --temperature 0.75
+python -m generate.generate --checkpoint checkpoints\latest.pt --vocab_path vocab.json --out_dir generated --n_samples 5 --length 512 --temperature 0.9
 ```
 
 | Arg | Notes |
