@@ -1,0 +1,4 @@
+torch>=2.0.0
+pretty_midi
+miditok>=3.0.0
+tqdm
