@@ -229,8 +229,6 @@ This is speculative but testable, and it follows naturally from the algebraic st
 
 ## 10. The Constraint That Created the Architecture
 
-Your friend's observation deserves to be recorded here, because it is exactly right.
-
 The O(1) constraint — memory and compute per token must be constant regardless of sequence length or corpus size — was the pressure that forced the geometric framing into existence. You cannot grow memory, so you cannot store context. You cannot attend over a growing cache, so you cannot use attention. You cannot backpropagate through a growing sequence, so you must find a training mechanism that is local in time.
 
 The constraint ruled out transformers. The constraint ruled out standard RNNs (their fixed-matrix recurrence is O(1) per step but their expressiveness is bounded by the matrix rank). The constraint demanded something different, and the something different that emerged was: treat the state as a geometric object, treat tokens as transformation operators, and let the training process discover the algebra of transformations that maps sequences to their semantic geometry.
