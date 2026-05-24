@@ -119,7 +119,7 @@ Requires Python 3.10+. GPU strongly recommended (CUDA). Tested on Windows with R
 python -m data.pipeline --midi_dir C:\path\to\midi\files --out_dir dataset --vocab_path vocab.json --workers 8
 ```
 
-Works with any MIDI dataset. Tested with Bach MIDI corpus and LMD (178k files).
+Works with any MIDI dataset. Tested with Bach MIDI corpus.
 
 ### 2. Train
 
