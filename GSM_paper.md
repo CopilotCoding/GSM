@@ -190,19 +190,21 @@ This is speculative but testable, and it follows naturally from the algebraic st
 
 | Epoch | Loss | Note |
 |-------|------|------|
-| 1 | 4.38 | Random baseline ~5.92 |
-| 5 | 2.00 | Structural learning begins |
-| 10 | 1.38 | Where small model finished |
-| 20 | 1.01 | Sub-1.0 threshold |
-| 30 | 0.81 | |
-| 47 | 0.51 | **"Sounds like Bach"** |
-| 60 | 0.32 | |
-| 80 | 0.17 | |
-| 100 | ~0.13 | Still falling |
+| 1 | 4.3802 | Random baseline ~5.92 |
+| 3 | 2.8804 | Steep structural drop |
+| 5 | 2.0017 | Structural learning established |
+| 10 | 1.3773 | Where the 6M param model finished after 30 epochs |
+| 20 | 1.0132 | Sub-1.0 threshold |
+| 30 | 0.8131 | |
+| 47 | 0.5119 | **"Sounds like Bach"** |
+| 60 | 0.3211 | |
+| 80 | 0.1683 | |
+| 90 | 0.1378 | |
+| 100 | 0.1196 | Final — still falling |
 
 **Generation quality**: At temperature 0.75, epoch 47+, generated MIDI described by a listener as "sounds like someone playing Bach." At temperature 0.1, generation is highly conservative and repetitive. At 0.75-0.9, generation has melodic coherence and harmonic structure consistent with Baroque counterpoint.
 
-**Comparative efficiency**: The previous best sequence model trained on this dataset (a standard transformer) required significantly more memory and longer training to reach comparable perceptual quality. The GSM achieved Bach-like generation in 47 epochs × ~35 seconds = approximately 27 minutes of training.
+**Comparative efficiency**: The previous best sequence model trained on this dataset (a standard transformer) required significantly more memory and longer training to reach comparable perceptual quality. The GSM achieved Bach-like generation in 47 epochs × ~35 seconds = 54 minutes and 12 seconds total on a single RTX 5060 Ti. The smaller 6M param GSM reached 1.3768 after 30 epochs (~9 min); the 32M model passed that at epoch 10 and reached 0.1196 by epoch 100.
 
 ---
 
