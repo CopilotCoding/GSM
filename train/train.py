@@ -130,6 +130,7 @@ def train(args):
 
     global_step = start_epoch * len(loader)
     run_start = time.time()
+    epoch_times = []
 
     for epoch in range(start_epoch, args.epochs):
         model.train()
@@ -169,10 +170,15 @@ def train(args):
 
             avg_loss = total_loss / (step + 1)
             lr_now = scheduler.get_last_lr()[0]
-            steps_done = global_step - start_epoch * len(loader)
-            steps_total = (args.epochs - start_epoch) * len(loader)
-            elapsed_run = time.time() - run_start
-            eta_run = (elapsed_run / max(steps_done, 1)) * (steps_total - steps_done)
+            epochs_left = args.epochs - epoch - 1
+            if epoch_times:
+                avg_epoch_time = sum(epoch_times[-3:]) / len(epoch_times[-3:])
+                frac_done = (step + 1) / len(loader)
+                eta_run = avg_epoch_time * (1 - frac_done) + avg_epoch_time * epochs_left
+            else:
+                elapsed_epoch = time.time() - epoch_start
+                rate = elapsed_epoch / max(step + 1, 1)
+                eta_run = rate * (len(loader) - step - 1)
 
             bar.set_postfix({
                 "loss": f"{avg_loss:.4f}",
@@ -183,6 +189,7 @@ def train(args):
 
         avg_loss = total_loss / len(loader)
         epoch_time = time.time() - epoch_start
+        epoch_times.append(epoch_time)
         epochs_left = args.epochs - epoch - 1
         eta_finish = datetime.now() + timedelta(seconds=(epoch_time * epochs_left))
 
