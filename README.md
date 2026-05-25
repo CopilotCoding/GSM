@@ -96,6 +96,8 @@ The state update is strictly sequential — each step depends on the previous on
 
 The fundamental tradeoff: **training speed scales with dataset size; inference speed does not.** For deployment on constrained hardware, streaming, or edge devices, GSM remains attractive. For large-scale training on a single consumer GPU without compile support, expect slower throughput than a transformer of equivalent parameter count.
 
+One area where GSM has a clear advantage: **tiny datasets.** The geometric state appears to generalize from very little data. GSM trained on 228 Bach MIDI files produces convincing baroque music. If your dataset is small, GSM is likely capable of learning from it.
+
 ---
 
 ## Results
