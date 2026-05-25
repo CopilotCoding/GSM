@@ -1,7 +1,7 @@
 """
 Dataset for GSM training.
-Reads from memory-mapped binary (fast) OR falls back to JSON files (slow).
-Use data/pack.py to convert JSON dataset to binary first.
+Loads packed binary into pinned RAM for maximum throughput.
+Falls back to JSON if no packed binary found.
 """
 
 import json
@@ -21,17 +21,19 @@ class MIDIDataset(Dataset):
         meta_path = data_path / "meta.json"
 
         if bin_path.exists() and meta_path.exists():
-            # Fast path: memory-mapped binary
             with open(meta_path) as f:
                 meta = json.load(f)
             self.total = meta["total_chunks"]
             self.chunk_len = meta["chunk_len"]
-            self.data = np.memmap(bin_path, dtype=np.uint16, mode='r',
-                                  shape=(self.total, self.chunk_len))
-            self._mode = "mmap"
-            print(f"Loaded {self.total:,} chunks from packed binary (instant)")
+
+            # Load entire binary into pinned RAM — fast GPU transfers, no disk reads during training
+            print(f"Loading {bin_path.stat().st_size / 1e9:.2f} GB into RAM...")
+            raw = np.memmap(bin_path, dtype=np.uint16, mode='r', shape=(self.total, self.chunk_len))
+            self.data = torch.from_numpy(np.array(raw, dtype=np.int64)).pin_memory()
+            del raw
+            self._mode = "ram"
+            print(f"Loaded {self.total:,} chunks into pinned RAM (instant access)")
         else:
-            # Slow fallback: JSON files
             print("No packed binary found — loading from JSON (slow). Run data/pack.py first.")
             self.chunks = []
             paths = list(data_path.glob("*.json"))
@@ -59,10 +61,10 @@ class MIDIDataset(Dataset):
         return self.total
 
     def __getitem__(self, idx):
-        if self._mode == "mmap":
-            chunk = self.data[idx].astype(np.int64)
+        if self._mode == "ram":
+            chunk = self.data[idx]
         else:
-            chunk = self.chunks[idx]
-        x = torch.tensor(chunk[:-1], dtype=torch.long)
-        y = torch.tensor(chunk[1:], dtype=torch.long)
+            chunk = torch.tensor(self.chunks[idx], dtype=torch.long)
+        x = chunk[:-1]
+        y = chunk[1:]
         return x, y
