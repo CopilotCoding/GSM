@@ -191,7 +191,8 @@ def train(args):
         epoch_time = time.time() - epoch_start
         epoch_times.append(epoch_time)
         epochs_left = args.epochs - epoch - 1
-        eta_finish = datetime.now() + timedelta(seconds=(epoch_time * epochs_left))
+        avg_epoch_t = sum(epoch_times[-3:]) / len(epoch_times[-3:]) if epoch_times else epoch_time
+        eta_finish = datetime.now() + timedelta(seconds=(avg_epoch_t * epochs_left))
 
         print(f"\n  ✓ Epoch {epoch+1}/{args.epochs} | loss={avg_loss:.4f} | "
               f"took={fmt_time(epoch_time)} | total={fmt_time(time.time()-run_start)} | "
