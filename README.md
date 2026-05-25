@@ -93,6 +93,17 @@ Tested on a single RTX 5060 Ti (16GB VRAM), Windows 11, pure PyTorch with no cus
 - Faster wall-clock per epoch than a scalar Mamba variant (SM1) trained on the same corpus at comparable parameter count by 5.6X
 - Loss descending cleanly from 5.15 → sub-2.0 in under 3 hours on 179k files
 
+GPU 0
+	NVIDIA GeForce RTX 5060 Ti
+	Driver version:	32.0.15.9186
+	Driver date:	1/20/2026
+	DirectX version:	12 (FL 12.2)
+	Physical location:	PCI bus 1, device 0, function 0
+	Utilization	67%
+	Dedicated GPU memory	3.4/16.0 GB
+	Shared GPU memory	8.1/15.9 GB
+	GPU Memory	11.5/31.9 GB
+
 The architecture is genuinely lightweight. A 18M parameter GSM trains faster than you'd expect for a sequential model, and inference is O(1) — fixed compute and memory per token regardless of sequence length.
 
 ---
