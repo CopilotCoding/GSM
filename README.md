@@ -83,6 +83,21 @@ There is no classical sequence model operation that corresponds to input-paramet
 
 ---
 
+## Training Tradeoffs
+
+GSM's O(1) inference property comes with a training cost that's worth understanding before committing to a large run.
+
+The state update is strictly sequential — each step depends on the previous one, so the forward pass is a Python loop over sequence length regardless of batch size. This means:
+
+- **Small datasets (<10k sequences):** Fast. The Bach corpus trained in 54 minutes.
+- **Large datasets (millions of sequences):** Slow. Each batch requires `seq_len` sequential GPU dispatches, and with millions of batches per epoch this compounds significantly.
+- **`torch.compile`** would fuse these kernel launches and largely solve the problem, but is not supported on Windows as of PyTorch 2.x.
+- **Custom CUDA kernels** could parallelize across the sequence dimension but defeat the goal of single-developer simplicity.
+
+The fundamental tradeoff: **training speed scales with dataset size; inference speed does not.** For deployment on constrained hardware, streaming, or edge devices, GSM remains attractive. For large-scale training on a single consumer GPU without compile support, expect slower throughput than a transformer of equivalent parameter count.
+
+---
+
 ## Results
 
 **Hardware**: RTX 5060 Ti (16GB VRAM)
