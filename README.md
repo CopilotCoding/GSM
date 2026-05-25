@@ -2,7 +2,7 @@
 
 > No attention. No KV cache. No quadratic scaling. A fixed point in R^N being continuously deformed by a learned algebra of transformations.
 
-Trained on 228 Bach MIDI files in 54 minutes on a single consumer GPU. Final loss 0.1196. Generates convincing baroque piano music.
+Trained on 228 Bach MIDI files in 54 minutes on a single consumer GPU. Final loss 0.1196. Generates convincing baroque piano music. Scales to 179k+ file datasets with memory-mapped binary packing — no architecture changes required.
 
 ---
 
@@ -129,11 +129,25 @@ python -m data.pipeline --midi_dir C:\path\to\midi\files --out_dir dataset --voc
 
 Works with any MIDI dataset. Tested with Bach MIDI corpus and LMD (178k files).
 
-### 2. Train
+### 2. Pack Dataset (recommended for large datasets)
+
+For datasets over ~1k files, convert to a memory-mapped binary before training. This eliminates the JSON loading bottleneck — dataset loads instantly regardless of size.
 
 ```cmd
-python -m train.train --data_dir dataset --vocab_path vocab.json --out_dir checkpoints --epochs 100
+python -m data.pack --data_dir dataset --out_dir dataset_packed --seq_len 256
 ```
+
+Run once after pipeline. Uses `uint16` storage (half the size of int32, safe up to vocab size 65535). For a 179k file dataset expect 10–20GB depending on average sequence length.
+
+Skip this step for small datasets (<1k files) — the JSON fallback is fast enough.
+
+### 3. Train
+
+```cmd
+python -m train.train --data_dir dataset_packed --vocab_path vocab.json --out_dir checkpoints --epochs 100 --workers 8
+```
+
+For small datasets without packing, use `--data_dir dataset` instead.
 
 Default hyperparameters (tuned for 16GB VRAM):
 
@@ -153,10 +167,10 @@ If you get OOM errors:
 python -m train.train --data_dir dataset --vocab_path vocab.json --out_dir checkpoints --batch_size 64 --state_dim 2048
 ```
 
-### 3. Generate
+### 4. Generate
 
 ```cmd
-python -m generate.generate --checkpoint checkpoints\latest.pt --vocab_path vocab.json --out_dir generated --n_samples 5 --length 512 --temperature 0.9
+python -m generate.generate --checkpoint checkpoints\latest.pt --vocab_path vocab.json --out_dir generated --n_samples 5 --length 512 --temperature 0.75
 ```
 
 | Arg | Notes |
@@ -168,7 +182,7 @@ python -m generate.generate --checkpoint checkpoints\latest.pt --vocab_path voca
 
 Output is `.mid` files. Open in MuseScore, FL Studio, Reaper, or drag into **midi.city** in browser to listen instantly.
 
-### 4. Sanity Check
+### 5. Sanity Check
 
 ```cmd
 python test.py
@@ -187,7 +201,8 @@ Verifies O(1) property, shape correctness, forward/backward pass.
 
 **Larger dataset (LMD 178k files):**
 ```cmd
---state_dim 4096 --epochs 30 --batch_size 128
+python -m data.pack --data_dir dataset --out_dir dataset_packed
+python -m train.train --data_dir dataset_packed --vocab_path vocab.json --out_dir checkpoints --state_dim 4096 --epochs 30 --batch_size 128 --workers 8
 ```
 
 **Low VRAM (<8GB):**
