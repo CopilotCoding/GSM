@@ -83,6 +83,20 @@ There is no classical sequence model operation that corresponds to input-paramet
 
 ---
 
+## Performance test 5/25/2026 on larger corpus of 170K+ files
+
+Tested on a single RTX 5060 Ti (16GB VRAM), Windows 11, pure PyTorch with no custom CUDA kernels, no torch.compile, no Triton:
+
+- **~29,000 tokens/second** sustained training throughput (batch 128, seq 128, bf16)
+- **18M parameter model** fits comfortably in under 6GB VRAM at these settings
+- **1.77 it/s** at batch size 128 — stable across the full epoch
+- Faster wall-clock per epoch than a scalar Mamba variant (SM1) trained on the same corpus at comparable parameter count by 5.6X
+- Loss descending cleanly from 5.15 → sub-2.0 in under 3 hours on 179k files
+
+The architecture is genuinely lightweight. A 18M parameter GSM trains faster than you'd expect for a sequential model, and inference is O(1) — fixed compute and memory per token regardless of sequence length.
+
+---
+
 ## Training Tradeoffs
 
 GSM's O(1) inference property comes with a training cost that's worth understanding before committing to a large run.
