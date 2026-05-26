@@ -65,7 +65,7 @@ def gpu_stats():
     total   = torch.cuda.get_device_properties(d).total_memory
     util    = torch.cuda.utilization(d) if hasattr(torch.cuda, "utilization") else -1
     return {
-        "vram_alloc_gb": round(alloc / 1e9, 3),
+        "vram_alloc_gb": round(reserved / 1e9, 3),
         "vram_reserved_gb": round(reserved / 1e9, 3),
         "vram_total_gb": round(total / 1e9, 3),
         "gpu_util_pct": util,
