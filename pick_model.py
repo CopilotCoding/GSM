@@ -216,8 +216,19 @@ def probe_config(cfg, device, batch_size, seq_len, bf16, vram_budget_gb):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def find_max_batch(cfg, device, seq_len, bf16, vram_budget_gb):
+    params = count_params(cfg)
+    # cap candidates based on model size — huge models can't fit large batches
+    if params > 500e6:
+        candidates = [1, 2, 4, 8]
+    elif params > 100e6:
+        candidates = [1, 2, 4, 8, 16, 32]
+    elif params > 10e6:
+        candidates = [1, 2, 4, 8, 16, 32, 64, 128]
+    else:
+        candidates = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+
     best = 1
-    for bs in [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]:
+    for bs in candidates:
         ok, _, _, _ = probe_config(cfg, device, bs, seq_len, bf16, vram_budget_gb)
         if ok:
             best = bs
@@ -249,6 +260,10 @@ def main():
     parser.add_argument("--probe_batch", type=int,   default=32,
                         help="Batch size used during probing (default 32)")
     args = parser.parse_args()
+
+    if args.factor <= 1.0:
+        print(f"\n  Error: --factor must be > 1.0 (got {args.factor}). Try --factor 1.25 or 2.0.")
+        sys.exit(1)
 
     SEP = "=" * 70
     sep = "─" * 70
