@@ -260,6 +260,7 @@ def train(args):
                     f"| loss {avg_loss:.4f} (smooth {smooth_loss:.4f}) "
                     f"| lr {lr_now:.2e} "
                     f"| {rate:.2f}it/s | {tok_per_sec/1000:.1f}k tok/s "
+                    f"| elapsed {fmt_time(time.time() - run_start)} "
                     f"| ETA ep {fmt_time(eta_epoch)} | ETA run {fmt_time(eta_run)}"
                     f"{vram_str}"
                 )

@@ -83,28 +83,17 @@ There is no classical sequence model operation that corresponds to input-paramet
 
 ---
 
-## Performance test 5/25/2026 on larger corpus of 170K+ files
+## Performance
 
 Tested on a single RTX 5060 Ti (16GB VRAM), Windows 11, pure PyTorch — no custom CUDA kernels, no `torch.compile`, no Triton:
 
 - **~29,000 tokens/second** sustained training throughput (batch 128, seq 128, bf16)
-- **18M parameter model** fits comfortably in under 6GB VRAM at these settings
-- **1.77 it/s** at batch size 128 — stable across the full epoch
-- Faster wall-clock per epoch than a scalar Mamba variant (SM1) trained on the same corpus at comparable parameter count by 5.6X
-- Loss descending cleanly from 5.15 → sub-2.0 in under 3 hours on 179k files
+- **18M parameter model** fits in under 6GB dedicated VRAM
+- **1.77 it/s** at batch 128 — stable across the full epoch
+- Faster wall-clock per epoch than a scalar Mamba variant trained on the same corpus at comparable parameter count
+- Loss descending from 5.15 → sub-2.0 in under 3 hours on 179k files, generating audible music before the first epoch completes
 
-GPU 0
-	NVIDIA GeForce RTX 5060 Ti
-	Driver version:	32.0.15.9186
-	Driver date:	1/20/2026
-	DirectX version:	12 (FL 12.2)
-	Physical location:	PCI bus 1, device 0, function 0
-	Utilization	67%
-	Dedicated GPU memory	3.4/16.0 GB
-	Shared GPU memory	8.1/15.9 GB
-	GPU Memory	11.5/31.9 GB
-
-The architecture is genuinely lightweight. A 18M parameter GSM trains faster than you'd expect for a sequential model, and inference is O(1) — fixed compute and memory per token regardless of sequence length.
+The architecture is genuinely lightweight. Inference is O(1) — fixed compute and memory per token regardless of sequence length. Token 1 and token 100,000 cost exactly the same.
 
 ---
 
@@ -238,7 +227,7 @@ Key training flags:
 | `--lr` | 3e-4 | Cosine annealed to 3e-5 |
 | `--save_steps` | 2000 | Save latest.pt every N steps |
 | `--save_minutes` | 30 | Also save a timestamped checkpoint every N minutes |
-| `--print_steps` | 10 | Print stats every N steps |
+| `--print_steps` | 10 | Print stats every N steps (includes elapsed time) |
 
 ### 4. Generate
 
@@ -271,7 +260,18 @@ python benchmark.py --checkpoint checkpoints\latest.pt --vocab_path vocab.json -
 
 The benchmark runs four tests: throughput vs sequence length (with O(1) confirmation), per-token latency distribution (min/median/p95/max), memory profiling (inference and training forward+backward), and batch size scaling.
 
-### 6. Sanity Check
+### 6. Plot Training
+
+Plot loss, throughput, VRAM, LR, and GPU utilization from the training CSV:
+
+```cmd
+python plot_training.py checkpoints\training_log.csv
+python plot_training.py checkpoints\training_log.csv --out plot.png --smooth 200
+```
+
+Requires `matplotlib` (`pip install matplotlib`). Outputs a dark-theme five-panel figure. Use `--out` to save to disk instead of opening a window.
+
+### 7. Sanity Check
 
 ```cmd
 python test.py
