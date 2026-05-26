@@ -83,7 +83,7 @@ There is no classical sequence model operation that corresponds to input-paramet
 
 ---
 
-## Performance
+## Performance TEST on 170K corpus
 
 Tested on a single RTX 5060 Ti (16GB VRAM), Windows 11, pure PyTorch — no custom CUDA kernels, no `torch.compile`, no Triton:
 
