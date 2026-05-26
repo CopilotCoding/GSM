@@ -154,12 +154,14 @@ class GSM(nn.Module):
         S = self.S0.unsqueeze(0).expand(batch, -1).clone()
         E = self.embed_drop(self.embedding(x))
 
-        logits_list = []
+        # Accumulate states, decode in one batched pass instead of 256 separate calls
+        states = torch.empty(batch, seq_len, self.state_dim, device=x.device, dtype=S.dtype)
         for t in range(seq_len):
             S = self.step(S, E[:, t, :])
-            logits_list.append(self.decoder(S))
+            states[:, t, :] = S
 
-        return torch.stack(logits_list, dim=1)
+        # (batch * seq_len, state_dim) -> (batch, seq_len, vocab_size)
+        return self.decoder(states.view(batch * seq_len, self.state_dim)).view(batch, seq_len, -1)
 
     @torch.no_grad()
     def generate(self, prompt: torch.Tensor, max_new_tokens: int = 256,
