@@ -85,7 +85,7 @@ There is no classical sequence model operation that corresponds to input-paramet
 
 ## Performance test 5/25/2026 on larger corpus of 170K+ files
 
-Tested on a single RTX 5060 Ti (16GB VRAM), Windows 11, pure PyTorch with no custom CUDA kernels, no torch.compile, no Triton:
+Tested on a single RTX 5060 Ti (16GB VRAM), Windows 11, pure PyTorch — no custom CUDA kernels, no `torch.compile`, no Triton:
 
 - **~29,000 tokens/second** sustained training throughput (batch 128, seq 128, bf16)
 - **18M parameter model** fits comfortably in under 6GB VRAM at these settings
@@ -99,12 +99,12 @@ The architecture is genuinely lightweight. A 18M parameter GSM trains faster tha
 
 ## Training Tradeoffs
 
-GSM's O(1) inference property comes with a training cost that's worth understanding before committing to a large run.
+GSM's O(1) inference property comes with a training cost worth understanding before committing to a large run.
 
 The state update is strictly sequential — each step depends on the previous one, so the forward pass is a Python loop over sequence length regardless of batch size. This means:
 
 - **Small datasets (<10k sequences):** Fast. The Bach corpus trained in 54 minutes.
-- **Large datasets (millions of sequences):** Slow. Each batch requires `seq_len` sequential GPU dispatches, and with millions of batches per epoch this compounds significantly.
+- **Large datasets (millions of sequences):** Slower. Each batch requires `seq_len` sequential GPU dispatches, and with millions of batches per epoch this compounds significantly.
 - **`torch.compile`** would fuse these kernel launches and largely solve the problem, but is not supported on Windows as of PyTorch 2.x.
 - **Custom CUDA kernels** could parallelize across the sequence dimension but defeat the goal of single-developer simplicity.
 
@@ -143,14 +143,42 @@ A smaller 6M parameter GSM trained on the same data reached a best loss of 1.376
 ## Installation
 
 ```cmd
-pip install torch pretty_midi miditok tqdm
+pip install torch pretty_midi miditok tqdm psutil
 ```
 
 Requires Python 3.10+. GPU strongly recommended (CUDA). Tested on Windows with RTX 5060 Ti.
 
+`psutil` is optional but enables full hardware detection in `pick_model.py` and `benchmark.py`.
+
 ---
 
 ## Usage
+
+### 0. Pick the right model size (recommended first step)
+
+Automatically detects your hardware, sweeps model sizes from smallest possible upward by a configurable factor, and outputs a ready-to-paste train command:
+
+```cmd
+python pick_model.py --data_dir dataset_packed_128 --vocab_path vocab.json
+```
+
+Options:
+
+| Arg | Default | Notes |
+|-----|---------|-------|
+| `--factor` | 2.0 | Scale factor between configs. Use 1.5 for finer steps |
+| `--vram_budget` | 0.80 | Fraction of free VRAM to use |
+| `--seq_len` | 128 | Sequence length used during probing |
+| `--probe_batch` | 32 | Batch size used during probing |
+
+Example output:
+```
+  Winner: config #5  |  18.37M params
+  state_dim:   2048
+  embed_dim:   512
+  ...
+  python -m train.train --data_dir dataset_packed_128 ...
+```
 
 ### 1. Process MIDI Dataset
 
@@ -162,15 +190,15 @@ Works with any MIDI dataset. Tested with Bach MIDI corpus and LMD (178k files).
 
 ### 2. Pack Dataset (recommended for large datasets)
 
-For datasets over ~1k files, convert to a memory-mapped binary before training. This eliminates the JSON loading bottleneck — dataset loads instantly regardless of size.
+For datasets over ~1k files, convert to a memory-mapped binary before training. Loads instantly into RAM regardless of dataset size.
 
 ```cmd
-python -m data.pack --data_dir dataset --out_dir dataset_packed --seq_len 256
+python -m data.pack --data_dir dataset --out_dir dataset_packed --seq_len 256 --workers 20
 ```
 
-Run once after pipeline. Uses `uint16` storage (half the size of int32, safe up to vocab size 65535). For a 179k file dataset expect 10–20GB depending on average sequence length.
+Run once after pipeline. The packed binary is read fully into pinned RAM at training startup for maximum GPU throughput. For 179k files expect ~2GB on disk.
 
-Skip this step for small datasets (<1k files) — the JSON fallback is fast enough.
+Skip for small datasets (<1k files) — the JSON fallback is fast enough.
 
 ### 3. Train
 
@@ -178,9 +206,14 @@ Skip this step for small datasets (<1k files) — the JSON fallback is fast enou
 python -m train.train --data_dir dataset_packed --vocab_path vocab.json --out_dir checkpoints --epochs 100 --workers 8
 ```
 
-For small datasets without packing, use `--data_dir dataset` instead.
+Training produces:
+- `checkpoints/latest.pt` — saved every `--save_steps` steps (default 2000)
+- `checkpoints/best.pt` — saved whenever a new best epoch loss is reached
+- `checkpoints/timed_*.pt` — timestamped saves every `--save_minutes` minutes (default 30)
+- `checkpoints/training_log.csv` — per-step log: loss, lr, tok/s, VRAM, timestamp
+- `checkpoints/run_stats.json` — end-of-run summary
 
-Default hyperparameters (tuned for 16GB VRAM):
+Key training flags:
 
 | Arg | Default | Notes |
 |-----|---------|-------|
@@ -192,11 +225,9 @@ Default hyperparameters (tuned for 16GB VRAM):
 | `--batch_size` | 128 | Reduce to 64 if OOM |
 | `--epochs` | 100 | Loss still falling at 100, more is fine |
 | `--lr` | 3e-4 | Cosine annealed to 3e-5 |
-
-If you get OOM errors:
-```cmd
-python -m train.train --data_dir dataset --vocab_path vocab.json --out_dir checkpoints --batch_size 64 --state_dim 2048
-```
+| `--save_steps` | 2000 | Save latest.pt every N steps |
+| `--save_minutes` | 30 | Also save a timestamped checkpoint every N minutes |
+| `--print_steps` | 10 | Print stats every N steps |
 
 ### 4. Generate
 
@@ -213,7 +244,23 @@ python -m generate.generate --checkpoint checkpoints\latest.pt --vocab_path voca
 
 Output is `.mid` files. Open in MuseScore, FL Studio, Reaper, or drag into **midi.city** in browser to listen instantly.
 
-### 5. Sanity Check
+### 5. Benchmark
+
+Inference speed and memory profiling suite. Proves O(1) throughput empirically.
+
+```cmd
+python benchmark.py --checkpoint checkpoints\latest.pt --vocab_path vocab.json
+```
+
+With full batch scaling sweep:
+
+```cmd
+python benchmark.py --checkpoint checkpoints\latest.pt --vocab_path vocab.json --full
+```
+
+The benchmark runs four tests: throughput vs sequence length (with O(1) confirmation), per-token latency distribution (min/median/p95/max), memory profiling (inference and training forward+backward), and batch size scaling.
+
+### 6. Sanity Check
 
 ```cmd
 python test.py
@@ -225,6 +272,8 @@ Verifies O(1) property, shape correctness, forward/backward pass.
 
 ## Hyperparameter Guide
 
+**Don't know where to start? Run `pick_model.py` first.** It probes your hardware and outputs the exact command to run.
+
 **Smaller dataset (<500 files):**
 ```cmd
 --state_dim 2048 --epochs 100 --batch_size 128
@@ -232,7 +281,7 @@ Verifies O(1) property, shape correctness, forward/backward pass.
 
 **Larger dataset (LMD 178k files):**
 ```cmd
-python -m data.pack --data_dir dataset --out_dir dataset_packed
+python -m data.pack --data_dir dataset --out_dir dataset_packed --workers 20
 python -m train.train --data_dir dataset_packed --vocab_path vocab.json --out_dir checkpoints --state_dim 4096 --epochs 30 --batch_size 128 --workers 8
 ```
 
