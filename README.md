@@ -90,7 +90,7 @@ Tested on a single RTX 5060 Ti (16GB VRAM), Windows 11, pure PyTorch — no cust
 - **~29,000 tokens/second** sustained training throughput (batch 128, seq 128, bf16)
 - **18M parameter model** fits in under 6GB dedicated VRAM
 - **1.77 it/s** at batch 128 — stable across the full epoch
-- Faster wall-clock per epoch than a scalar Mamba variant trained on the same corpus at comparable parameter count
+- Faster wall-clock per epoch than a scalar Mamba variant trained on the same corpus at comparable parameter count by 6X (9 hours vs 56 hours)
 - Loss descending from 5.15 → sub-2.0 in under 3 hours on 179k files, generating audible music before the first epoch completes
 
 The architecture is genuinely lightweight. Inference is O(1) — fixed compute and memory per token regardless of sequence length. Token 1 and token 100,000 cost exactly the same.
