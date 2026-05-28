@@ -1,3 +1,6 @@
+WORKING ON TRAINING PARALLELIZATION SOLUTION, CURRENTLY SEEING GOOD RESULTS
+
+
 # GSM — Geometric State Machine
 
 > No attention. No KV cache. No quadratic scaling. A fixed point in R^N being continuously deformed by a learned algebra of transformations.
