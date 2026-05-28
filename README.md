@@ -89,14 +89,14 @@ GSM’s O(1) inference property comes with a training dynamic that is important 
 
 The state update is strictly sequential — each step depends on the previous one, so the forward pass is a loop over sequence length regardless of batch size. This means:
 
-* **Small datasets (<10k sequences):** Very efficient. The Bach corpus trains in ~54 minutes.
+* **Small datasets (<10k sequences):** The Bach corpus trains in ~54 minutes.
 * **Large datasets (millions of sequences):** Slower wall-clock training due to sequential state evolution per token.
 * **`torch.compile`** would significantly improve throughput by fusing step execution, but is not available in all environments.
 * **Custom CUDA kernels** could parallelize sequence dynamics, but are intentionally avoided to preserve simplicity and portability.
 
 The fundamental tradeoff: **training cost scales with dataset size; inference cost does not.**
 
-For small to medium datasets, GSM is highly efficient and stable. For large datasets, it remains viable but benefits strongly from optimized compilation paths.
+For large datasets, it remains viable but benefits strongly from optimized compilation paths.
 
 A key empirical result: **GSM learns effectively from very small datasets.** On just 228 Bach MIDI files, it produces coherent, stylistically consistent baroque output.
 
@@ -131,7 +131,7 @@ Outputs are not merely “melodic fragments” — they exhibit **coherent baroq
 * cadential resolution behavior
 * stable rhythmic motifs
 
-A smaller 6M parameter GSM trained on the same dataset reached a best loss of 1.3768 after 30 epochs (~9 minutes). The 32M model surpassed this early (by epoch 10) and continued refining structural coherence to 0.1196.
+A smaller 6M parameter GSM trained on the same dataset reached a best loss of 1.3768 after 30 epochs which failed to produce proper music (~9 minutes). The 32M model surpassed this early (by epoch 10) and continued refining structural coherence to 0.1196.
 
 ---
 
