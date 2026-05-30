@@ -19,6 +19,28 @@ The model maintains a single fixed-size point `S ∈ R^N` — a position in a hi
 
 Knowledge isn't stored. It's shaped into the geometry.
 
+Imagine you're trying to understand a piece of music by listening to it note by note.
+
+A transformer is like someone who writes down every note they hear on a piece of paper, then whenever they need to understand the next note, they look back at everything they've written. The longer the piece, the more paper they need, and the longer it takes to look things up. It's powerful but expensive.
+
+An RNN is like someone who keeps a single "impression" in their head and updates it as each note plays — but their head only has so much room, and old notes tend to get crowded out. They can only kind of remember the distant past.
+
+GSM does something different. Imagine you have a ball floating in an enormous space — thousands of dimensions, far more than the three we can picture. Each note you hear doesn't get written down or crammed into a memory. Instead, it *pushes and rotates the ball* in that space. Each note is a transformation operator: it shoves the ball, scales it, twists it through certain dimensions by a learned angle.
+
+By the end of the piece, the ball is sitting somewhere specific in that enormous space. That position *is* the model's understanding of everything it's heard. Not a list of notes. Not a compressed summary. A geometric position that accumulated the entire sequence through continuous deformation.
+
+When the model wants to predict the next note, it just looks at where the ball is sitting right now and asks: given this position in this space, what note comes next?
+
+**Why does this work?**
+
+In a space with 4096 dimensions, you have an almost incomprehensible amount of room to encode structure. Musical patterns — a chord progression, a rhythmic motif, a harmonic resolution — each carve out a characteristic trajectory through that space during training. The model learns which pushes and rotations correspond to which musical events, so that similar musical contexts end up moving the ball to similar regions.
+
+You're not storing the music. You're letting the music reshape a geometry, and trusting that geometry to remember what matters.
+
+**The key property:** each note takes exactly the same amount of compute to process, and the ball stays the same size regardless of how long the piece is. There's no growing list, no quadratic blowup. O(1) per token, forever.
+
+**What's the catch?** Because each step depends on the previous position of the ball, you can't process notes in parallel during training — you have to go one at a time. That's the tradeoff for the elegant O(1) inference. The model trains slower than a transformer but runs faster and cheaper at any sequence length.
+
 ---
 
 ## Why It's Different From An RNN
