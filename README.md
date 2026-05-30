@@ -19,6 +19,8 @@ The model maintains a single fixed-size point `S ∈ R^N` — a position in a hi
 
 Knowledge isn't stored. It's shaped into the geometry.
 
+# For beginners:
+
 Imagine you're trying to understand a piece of music by listening to it note by note.
 
 A transformer is like someone who writes down every note they hear on a piece of paper, then whenever they need to understand the next note, they look back at everything they've written. The longer the piece, the more paper they need, and the longer it takes to look things up. It's powerful but expensive.
@@ -41,6 +43,36 @@ You're not storing the music. You're letting the music reshape a geometry, and t
 
 **What's the catch?** Because each step depends on the previous position of the ball, you can't process notes in parallel during training — you have to go one at a time. That's the tradeoff for the elegant O(1) inference. The model trains slower than a transformer but runs faster and cheaper at any sequence length.
 
+# For experts:
+
+GSM is a fixed-dimensional state space model with a geometric inductive bias. The state `S ∈ R^N` evolves under a sequence of input-parameterized transformations rather than a learned autonomous dynamics matrix. The update rule at each step is:
+
+```
+S' = gate ⊙ Rotate(scale ⊙ S + shift) + (1 - gate) ⊙ S
+S' = LayerNorm(S')
+```
+
+where `scale`, `shift`, `gate ∈ R^N` and the rotation angles `θ ∈ R^{n_pairs}` are all outputs of a 6-layer residual MLP — TransformNet — conditioned on the current token embedding. Nothing in the update rule is autonomous: `S` has no direct recurrence through a fixed weight matrix. It only moves when a token moves it, and the direction and magnitude of movement are entirely input-determined.
+
+**The rotation component** is the architecturally novel piece. A fixed set of `n_pairs` random index pairs `(i, j) ⊂ [N]²` are sampled at initialization and frozen. For each pair, TransformNet produces an angle `θ_k`, and a 2D rotation is applied in that subspace:
+
+```
+[S_i, S_j] ← [cos θ_k · S_i - sin θ_k · S_j,  sin θ_k · S_i + cos θ_k · S_j]
+```
+
+All pairs are computed in parallel via gather/scatter. This is a sparse approximation to a full SO(N) group action — the model learns to compose subspace rotations to implement semantic transformations. It's isometric by construction, which acts as an implicit norm-preserving regularizer on the state trajectory before the gate mixing and LayerNorm.
+
+**Relation to SSMs.** GSM superficially resembles S4/Mamba in maintaining a fixed-size latent state, but the similarity is shallow. SSMs parameterize a linear dynamical system `S' = AS + Bx` where `A` is a structured matrix (diagonal-plus-low-rank, HiPPO-initialized) optimized to capture long-range dependencies through careful eigenspectrum control. The input modulates the input projection `B` and sometimes `Δ` (discretization step), but the core dynamics matrix `A` is fixed or input-independent.
+
+GSM has no autonomous dynamics at all. The entire transformation — including what would correspond to `A` — is a function of the input. This is a stronger form of input-conditioning and removes the need for eigenspectrum engineering, but it also means the model can't learn input-independent temporal dynamics. Whether that's a limitation or a feature depends on the domain.
+
+**Relation to GRUs.** The gate mechanism `S' = gate ⊙ S_new + (1 - gate) ⊙ S` is structurally identical to a GRU update gate, and the shift/scale is analogous to the candidate hidden state. The difference is that a GRU computes its candidate via `tanh(W_h · (r ⊙ h) + W_x · x)` — a fixed recurrent projection `W_h` applied to the gated previous state. GSM replaces this entirely: there is no `W_h`, and the candidate state is produced by a geometric operation (rotation in random subspaces) rather than a linear projection. The inductive bias shifts from "linear memory compression" to "isometric geometric deformation."
+
+**The parallelization constraint.** The sequential dependency `S_t = f(S_{t-1}, x_t)` makes the recurrence irreducibly sequential — you can't parallelize across time the way transformers can with attention. However, TransformNet — which is the dominant compute cost — has no dependency on `S`. Given the full embedding sequence `E ∈ R^{B×T×d}`, all `T` TransformNet calls can be batched as a single `[B·T, d]` forward pass, producing all transformation parameters in one matmul. The recurrence then runs as a cheap sequential loop over elementwise ops. This gives 2–3× inference speedup at the cost of larger intermediate tensors, and is the correct parallelization given the architecture's constraints.
+
+**Why it works on small datasets.** The geometric inductive bias imposes strong structure on the hypothesis space. Subspace rotations are a highly constrained family of transformations — the model can't implement arbitrary state transitions, only isometric deformations followed by gated mixing. On a small corpus like 228 MIDI files, this constraint acts as an implicit regularizer that prevents the kind of memorization a less constrained model would fall into. The state trajectory is forced to encode structure geometrically, and geometric structure generalizes better than memorized token sequences when data is scarce.
+
+**Open questions.** Whether the random fixed subspace pairs are the right structure — versus learned pairs, full dense rotations, or a hierarchical decomposition — is unexplored. The initialization of `S_0` as a learned parameter rather than zero or a fixed point is also non-obvious; it means the model learns a "prior geometric position" that all sequences start from. The LayerNorm after each step keeps the state on a roughly unit hypersphere, which combined with the isometric rotations suggests the effective geometry is closer to spherical than flat — despite the architecture operating in flat R^N.
 ---
 
 ## Why It's Different From An RNN
