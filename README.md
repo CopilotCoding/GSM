@@ -68,7 +68,7 @@ A 6-layer MLP with residual connections that maps a token embedding to transform
 
 ### RotarySubspaceTransform
 
-The geometrically novel component. A fixed set of random dimension pairs `(i, j)` in R^N. For each pair, the model produces a rotation angle and applies a 2D rotation in that subspace. All pairs computed simultaneously via gather/scatter — no Python loops, fully vectorized on GPU.
+The geometrically novel component. A fixed set of random dimension pairs `(i, j)` in R^N. For each pair, the model produces a rotation angle and applies a 2D rotation in that subspace. All pairs computed simultaneously via indexing — no Python loops, fully vectorized on GPU.
 
 There is no classical sequence model operation that corresponds to input-parameterized subspace rotations on a fixed geometric object.
 
@@ -86,20 +86,47 @@ There is no classical sequence model operation that corresponds to input-paramet
 
 ---
 
+## Parallelization
+
+GSM's forward pass splits cleanly into two phases with different parallelism characteristics:
+
+**TransformNet** — the 6-layer MLP that maps embeddings to transformation parameters — has no dependency on the state `S`. All `seq_len` token embeddings can be processed simultaneously in a single batched matmul: `[batch × seq_len, embed_dim]` instead of `seq_len` separate `[batch, embed_dim]` calls. This is the dominant compute cost and benefits fully from GPU parallelism.
+
+**The recurrence** — applying scale, rotate, gate, and LayerNorm to update `S` — is inherently sequential: `S_t` depends on `S_{t-1}`. It runs as a Python loop over `seq_len` steps but only does cheap elementwise ops per step; the expensive MLP computation has already been done.
+
+This gives two forward paths, selected automatically by `model.train()` / `model.eval()`:
+
+| Mode      | TransformNet          | Recurrence  | When used              |
+| --------- | --------------------- | ----------- | ---------------------- |
+| Training  | Per-step (small tensors, fast backward) | Sequential | `model.train()` |
+| Inference | Batched across full sequence (2–3× faster) | Sequential | `model.eval()` |
+
+**Benchmark results** (RTX 5060 Ti, seq_len=256, bfloat16, no compile):
+
+| Metric                        | Original   | Optimized   | Speedup |
+| ----------------------------- | ---------- | ----------- | ------- |
+| Forward throughput (batch=32) | 38k tok/s  | 135k tok/s  | 3.6×    |
+| Forward throughput (batch=128)| 140k tok/s | 333k tok/s  | 2.4×    |
+| Latency p50 (batch=128)       | 246ms      | 104ms       | 2.4×    |
+| Training throughput (batch=32)| 9k tok/s   | 9k tok/s    | 1.0×    |
+| First-step latency            | 443ms      | 90ms        | 4.9×    |
+
+Training throughput is identical to the original — the parallelization applies to inference and generation only, where it delivers 2–3× speedup. On Linux/WSL2 with `torch.compile` (TransformNet + decoder submodules), inference gains a further 10–30%.
+
+---
+
 ## Training Tradeoffs
 
-GSM’s O(1) inference property comes with a training dynamic that is important to understand.
+GSM's O(1) inference property comes with a training dynamic that is important to understand.
 
-The state update is strictly sequential — each step depends on the previous one, so the forward pass is a loop over sequence length regardless of batch size. This means:
+The state update is strictly sequential — each step depends on the previous one, so the training forward pass is a loop over sequence length. This means:
 
 * **Small datasets (<10k sequences):** The Bach corpus trains in ~54 minutes.
 * **Large datasets (millions of sequences):** Slower wall-clock training due to sequential state evolution per token.
-* **`torch.compile`** would significantly improve throughput by fusing step execution, but is not available in all environments.
-* **Custom CUDA kernels** could parallelize sequence dynamics, but are intentionally avoided to preserve simplicity and portability.
+* **`torch.compile`** improves throughput on Linux/WSL2 by fusing TransformNet and decoder kernels. Not available on native Windows (no Triton), enabled automatically when detected.
+* **Custom CUDA kernels** could parallelize sequence dynamics further, but are intentionally avoided to preserve simplicity and portability.
 
 The fundamental tradeoff: **training cost scales with dataset size; inference cost does not.**
-
-For large datasets, it remains viable but benefits strongly from optimized compilation paths.
 
 A key empirical result: **GSM learns effectively from very small datasets.** On just 228 Bach MIDI files, it produces coherent, stylistically consistent baroque output.
 
@@ -127,7 +154,7 @@ A key empirical result: **GSM learns effectively from very small datasets.** On 
 
 At temperature 0.75 after epoch 47: generates **convincing baroque piano music** with stable harmonic progression, recognizable cadence structure, and consistent rhythmic phrasing.
 
-Outputs are not merely “melodic fragments” — they exhibit **coherent baroque-style composition structure**, including:
+Outputs are not merely "melodic fragments" — they exhibit **coherent baroque-style composition structure**, including:
 
 * phrase repetition with variation
 * functional harmonic movement
@@ -141,12 +168,10 @@ A smaller 6M parameter GSM trained on the same dataset reached a best loss of 1.
 ## Installation
 
 ```cmd
-pip install torch pretty_midi miditok tqdm psutil
+pip install torch pretty_midi miditok tqdm rich nvidia-ml-py psutil
 ```
 
-Requires Python 3.10+. GPU strongly recommended (CUDA). Tested on Windows with RTX 5060 Ti.
-
-`psutil` is optional but enables full hardware detection in `pick_model.py` and `benchmark.py`.
+Requires Python 3.10+. GPU strongly recommended (CUDA). Tested on Windows 11 and WSL2 with RTX 5060 Ti.
 
 ---
 
@@ -169,27 +194,24 @@ Options:
 | `--seq_len`     | 128     | Probe sequence length        |
 | `--probe_batch` | 32      | Batch size                   |
 
-Example output:
-
-```
-Winner: config #5 | 18.37M params
-...
-```
-
 ---
 
 ### 1. Process MIDI Dataset
 
 ```cmd
-python -m data.pipeline --midi_dir C:\path\to\midi\files --out_dir dataset --vocab_path vocab.json --workers 8
+python -m data.pipeline --midi_dir /path/to/midi/files --out_dir dataset --vocab_path vocab.json --workers 8
 ```
+
+On Windows use quoted forward-slash paths or WSL mount paths to avoid shell escaping issues with parentheses or spaces.
 
 ---
 
-### 2. Pack Dataset (recommended for large datasets)
+### 2. Pack Dataset (recommended)
+
+Converts JSON token files to a memory-mapped binary for fast training. Strongly recommended for any dataset above a few hundred files.
 
 ```cmd
-python -m data.pack --data_dir dataset --out_dir dataset_packed --seq_len 256 --workers 20
+python -m data.pack --data_dir dataset --out_dir dataset_packed --seq_len 256 --workers 8
 ```
 
 ---
@@ -197,21 +219,45 @@ python -m data.pack --data_dir dataset --out_dir dataset_packed --seq_len 256 --
 ### 3. Train
 
 ```cmd
-python -m train.train --data_dir dataset_packed --vocab_path vocab.json --out_dir checkpoints --epochs 100 --workers 8
+python -m train.train --data_dir dataset_packed --vocab_path vocab.json --out_dir checkpoints --epochs 100
 ```
 
-Outputs:
+Displays a live Rich terminal UI with:
+- Overall run progress bar (epochs, elapsed, ETA)
+- Per-epoch progress bar (batches, %, ETA)
+- Live stats panel (loss, smooth loss, LR, tok/s, VRAM, GPU utilization)
+- Epoch summaries with best-loss tracking
 
-* `latest.pt`
-* `best.pt`
-* logs + samples + metrics
+Outputs:
+* `latest.pt` — checkpoint saved every `--save_steps` steps
+* `best.pt` — lowest validation loss checkpoint
+* `epoch_NNN_lossX.XXXX.pt` — per-epoch snapshots
+* `training_log.csv` — full step-level metrics
+* `run_stats.json` — final run summary
+
+Key arguments:
+
+| Arg              | Default | Notes                               |
+| ---------------- | ------- | ----------------------------------- |
+| `--epochs`       | 100     |                                     |
+| `--batch_size`   | 128     |                                     |
+| `--seq_len`      | 256     |                                     |
+| `--state_dim`    | 4096    | Geometric state dimensionality      |
+| `--embed_dim`    | 512     |                                     |
+| `--n_pairs`      | 128     | Rotation subspace pairs             |
+| `--hidden_dim`   | 1024    | TransformNet hidden width           |
+| `--n_layers`     | 6       | TransformNet depth                  |
+| `--lr`           | 3e-4    | Cosine annealed to 3e-5             |
+| `--save_steps`   | 2000    | Step checkpoint frequency           |
+| `--save_minutes` | 30      | Timed checkpoint frequency          |
+| `--print_steps`  | 10      | Stats panel refresh frequency       |
 
 ---
 
 ### 4. Generate
 
 ```cmd
-python -m generate.generate --checkpoint checkpoints\latest.pt --vocab_path vocab.json --out_dir generated --n_samples 5 --length 512 --temperature 0.75
+python -m generate.generate --checkpoint checkpoints/latest.pt --vocab_path vocab.json --out_dir generated --n_samples 5 --length 512 --temperature 0.75
 ```
 
 At 0.75 temperature, outputs are **stylistically stable baroque compositions** suitable for direct listening in MIDI DAWs.
@@ -220,22 +266,25 @@ At 0.75 temperature, outputs are **stylistically stable baroque compositions** s
 
 ### 5. Benchmark
 
+Compare original vs optimized forward/training throughput:
+
 ```cmd
-python benchmark.py --checkpoint checkpoints\latest.pt --vocab_path vocab.json
+python benchmark_compare.py
+python benchmark_compare.py --trials 20 --seq_len 512
 ```
 
-Confirms:
+Original architecture benchmark (O(1) inference scaling confirmation):
 
-* O(1) inference scaling
-* constant memory usage
-* stable throughput across sequence lengths
+```cmd
+python benchmark.py --checkpoint checkpoints/latest.pt --vocab_path vocab.json
+```
 
 ---
 
 ### 6. Plot Training
 
 ```cmd
-python plot_training.py checkpoints\training_log.csv
+python plot_training.py checkpoints/training_log.csv
 ```
 
 ---

@@ -36,10 +36,11 @@ class RotarySubspaceTransform(nn.Module):
         b = S[:, self.idx_b]
         new_a = cos_t * a - sin_t * b
         new_b = sin_t * a + cos_t * b
-        S = S.clone()
-        S.scatter_(1, self.idx_a.unsqueeze(0).expand_as(new_a), new_a)
-        S.scatter_(1, self.idx_b.unsqueeze(0).expand_as(new_b), new_b)
-        return S
+        # Clone once, then use indexing assignment (cleaner than scatter_ + expand)
+        S_new = S.clone()
+        S_new[:, self.idx_a] = new_a
+        S_new[:, self.idx_b] = new_b
+        return S_new
 
 
 class TransformNet(nn.Module):
@@ -149,18 +150,54 @@ class GSM(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
+    @torch.compiler.disable
+    def _forward_train(self, S, E, batch, seq_len):
+        """
+        Training forward: run TransformNet step-by-step alongside the recurrence.
+        The batched [batch*seq_len] approach is faster for inference (no grad) but
+        slower for training because the large output tensor creates excess memory
+        bandwidth pressure during backward. Per-step here keeps tensors small.
+        """
+        states = torch.empty(batch, seq_len, self.state_dim,
+                             device=S.device, dtype=S.dtype)
+        for t in range(seq_len):
+            S = self.step(S, E[:, t, :])
+            states[:, t] = S
+        return states
+
+    @torch.compiler.disable
+    def _forward_inference(self, S, E, batch, seq_len):
+        """
+        Inference forward: batch all TransformNet calls across time in one matmul,
+        then run the cheap recurrence. 2-3x faster with no grad.
+        """
+        E_flat = E.reshape(batch * seq_len, self.embed_dim)
+        scale_f, shift_f, gate_f, angles_f = self.step.transform_net(E_flat)
+        scale  = scale_f.view(batch, seq_len, self.state_dim)
+        shift  = shift_f.view(batch, seq_len, self.state_dim)
+        gate   = gate_f.view(batch, seq_len, self.state_dim)
+        angles = angles_f.view(batch, seq_len, self.step.rotary.n_pairs)
+        states = torch.empty(batch, seq_len, self.state_dim,
+                             device=S.device, dtype=S.dtype)
+        for t in range(seq_len):
+            S_t = self.step.rotary(scale[:, t] * S + shift[:, t], angles[:, t])
+            S   = gate[:, t] * S_t + (1.0 - gate[:, t]) * S
+            S   = self.step.norm(S)
+            states[:, t] = S
+        return states
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch, seq_len = x.shape
         S = self.S0.unsqueeze(0).expand(batch, -1).clone()
         E = self.embed_drop(self.embedding(x))
 
-        # Accumulate states, decode in one batched pass instead of 256 separate calls
-        states = torch.empty(batch, seq_len, self.state_dim, device=x.device, dtype=S.dtype)
-        for t in range(seq_len):
-            S = self.step(S, E[:, t, :])
-            states[:, t, :] = S
+        if self.training:
+            # Per-step TransformNet: smaller tensors, faster backward
+            states = self._forward_train(S, E, batch, seq_len)
+        else:
+            # Batched TransformNet: one big matmul, 2-3x faster inference
+            states = self._forward_inference(S, E, batch, seq_len)
 
-        # (batch * seq_len, state_dim) -> (batch, seq_len, vocab_size)
         return self.decoder(states.view(batch * seq_len, self.state_dim)).view(batch, seq_len, -1)
 
     @torch.no_grad()

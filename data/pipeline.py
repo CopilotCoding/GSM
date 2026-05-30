@@ -56,17 +56,26 @@ def tokenize_midi_path(tok, path):
     return None
 
 
-def process_file(args):
-    path, vocab_path, out_dir = args
+# Module-level tokenizer for pool workers — built once per worker, not once per file.
+_worker_tok = None
+_worker_out_dir = None
+
+def _pool_worker_init(vocab_path, out_dir):
+    global _worker_tok, _worker_out_dir
+    _worker_tok = build_tokenizer(vocab_path)
+    _worker_out_dir = out_dir
+
+
+def process_file(path):
+    """Worker function — uses module-level tokenizer set by _pool_worker_init."""
     try:
-        tok = build_tokenizer(vocab_path)
-        ids = tokenize_midi_path(tok, path)
+        ids = tokenize_midi_path(_worker_tok, path)
 
         if ids is None or len(ids) < 16:
             return None
 
         stem = Path(path).stem
-        out_path = Path(out_dir) / f"{stem}.json"
+        out_path = Path(_worker_out_dir) / f"{stem}.json"
         with open(out_path, "w") as f:
             json.dump(ids, f)
 
@@ -129,12 +138,16 @@ def run_pipeline(midi_dir: str, out_dir: str, vocab_path: str, workers: int = 8)
     print(f"Vocab size: {vocab_size}")
 
     # Process all files
-    args_list = [(p, vocab_path, out_dir) for p in paths]
     success = 0
     errors = 0
 
-    with multiprocessing.Pool(workers) as pool:
-        for result in tqdm(pool.imap_unordered(process_file, args_list),
+    # Initializer builds the tokenizer once per worker instead of once per file.
+    with multiprocessing.Pool(
+        workers,
+        initializer=_pool_worker_init,
+        initargs=(vocab_path_used, out_dir),
+    ) as pool:
+        for result in tqdm(pool.imap_unordered(process_file, [str(p) for p in paths]),
                            total=len(paths), desc="Processing"):
             if result is not None:
                 success += 1
