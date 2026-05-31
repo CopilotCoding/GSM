@@ -366,6 +366,37 @@ python -m data.pack ...
 --state_dim 4096 --epochs 30 --batch_size 128
 ```
 
+## Live Playback
+
+Stream generated music directly to your MIDI output in real time as the model generates it.
+
+```bash
+python play_live.py --checkpoint checkpoints/best.pt --vocab_path vocab.json
+```
+
+### Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--checkpoint` | required | Path to trained `.pt` checkpoint |
+| `--vocab_path` | `vocab.json` | Path to tokenizer vocab |
+| `--buffer_secs` | `3.0` | Seconds to pre-load before playback starts |
+| `--temperature` | `0.9` | Sampling temperature |
+| `--top_k` | `50` | Top-k sampling cutoff |
+| `--bpm` | `120.0` | Assumed tempo for timing |
+| `--max_tokens` | `None` | Stop after N tokens (omit for infinite) |
+| `--prompt_tokens` | `None` | Comma-separated seed token IDs |
+| `--device` | auto | `cuda` or `cpu` |
+
+### Requirements
+
+- `pygame` — `pip install pygame`
+- A system MIDI output device (Windows: built-in. Linux: requires `timidity` or `fluidsynth` running as a MIDI sink)
+
+### How it works
+
+A generation thread steps the GSM one token at a time and decodes REMI tokens into notes as they arrive. A playback thread buffers `--buffer_secs` of audio before starting, then stays that far ahead of the playback head — so generation and playback run concurrently with no audible gaps. Ctrl+C stops cleanly.
+
 ---
 
 ## The Geometric Intuition
