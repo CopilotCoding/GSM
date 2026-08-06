@@ -4,9 +4,11 @@ POTENTIAL USE CASE IS STREAMING TRAINING AND INFERENCE AT THE SAME TIME ONLINE L
 
 > No attention. No KV cache. No quadratic scaling. A fixed point in R^N being continuously deformed by a learned algebra of transformations.
 
-**Training parallelization is solved.** The recurrence is now an associative scan that resolves a whole sequence in O(log T) depth instead of a T-step loop — see [Parallelization](#parallelization). The results below predate that change and were produced by the older sequential recurrence.
+**Training parallelization is solved.** The recurrence is now an associative scan that resolves a whole sequence in O(log T) depth instead of a T-step loop — verified exact to 5.1e-13 in float64 at T=512, with training cost roughly flat in sequence length. See [Parallelization](#parallelization).
 
-Trained on 228 Bach MIDI files in 54 minutes on a single consumer GPU. Final loss 0.1196. Generates convincing baroque piano music. Scales to 179k+ file datasets with memory-mapped binary packing — no architecture changes required.
+Scales to 179k+ file datasets with memory-mapped binary packing — no architecture changes required.
+
+⚠️ **The scan model has not been trained to convergence yet.** The Bach results this README previously led with — 228 files, 54 minutes, final loss 0.1196, convincing baroque output — were produced by the older sequential recurrence, which has since been replaced. They are preserved in [Results](#results) as the historical record of the approach, but they do not describe the current code and have not been reproduced under it. What is currently verified for the scan: exactness against a step-by-step reference, stability without gradient clipping at seq_len 512, and a 60-step smoke test where loss decreases. Convergence quality and generation quality are open.
 
 ---
 
@@ -207,7 +209,7 @@ What remains:
 
 Training cost still scales with dataset size; inference cost does not.
 
-A key empirical result: **GSM learns effectively from very small datasets.** On just 228 Bach MIDI files, it produces coherent, stylistically consistent baroque output.
+A key empirical result from the sequential recurrence: **GSM learned effectively from very small datasets** — on just 228 Bach MIDI files it produced coherent, stylistically consistent baroque output. Whether the scan formulation retains that small-data property is untested; the geometric inductive bias argument for it is unchanged, but the argument is not evidence.
 
 ---
 
@@ -347,7 +349,7 @@ Key arguments:
 python -m generate.generate --checkpoint checkpoints/latest.pt --vocab_path vocab.json --out_dir generated --n_samples 5 --length 512 --temperature 0.75
 ```
 
-At 0.75 temperature, outputs are **stylistically stable baroque compositions** suitable for direct listening in MIDI DAWs.
+At 0.75 temperature the sequential-recurrence model produced stylistically stable baroque compositions suitable for direct listening in MIDI DAWs. Output quality under the scan formulation has not been evaluated — that temperature is a reasonable starting point, not a tuned recommendation.
 
 ---
 
