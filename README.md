@@ -1,10 +1,10 @@
-WORKING ON TRAINING PARALLELIZATION SOLUTION, STRUGGLING WITH THIS ISSUE
-
 POTENTIAL USE CASE IS STREAMING TRAINING AND INFERENCE AT THE SAME TIME ONLINE LEARNING AND INFERENCE.
 
 # GSM — Geometric State Machine
 
 > No attention. No KV cache. No quadratic scaling. A fixed point in R^N being continuously deformed by a learned algebra of transformations.
+
+**Training parallelization is solved.** The recurrence is now an associative scan that resolves a whole sequence in O(log T) depth instead of a T-step loop — see [Parallelization](#parallelization). The results below predate that change and were produced by the older sequential recurrence.
 
 Trained on 228 Bach MIDI files in 54 minutes on a single consumer GPU. Final loss 0.1196. Generates convincing baroque piano music. Scales to 179k+ file datasets with memory-mapped binary packing — no architecture changes required.
 
@@ -42,18 +42,29 @@ You're not storing the music. You're letting the music reshape a geometry, and t
 
 **The key property:** each note takes exactly the same amount of compute to process, and the ball stays the same size regardless of how long the piece is. There's no growing list, no quadratic blowup. O(1) per token, forever.
 
-**What's the catch?** Because each step depends on the previous position of the ball, you can't process notes in parallel during training — you have to go one at a time. That's the tradeoff for the elegant O(1) inference. The model trains slower than a transformer but runs faster and cheaper at any sequence length.
+**What about training speed?** This used to be the catch. Because each step depends on the previous position of the ball, the obvious way to train is one note at a time — no parallelism, slow on a GPU.
+
+The fix is a trick about *order of operations*. If each note's effect on the ball can be written as "stretch it by this much, then nudge it by that much," then two notes in a row can be collapsed into a single combined stretch-and-nudge before either is applied to the ball. Do that pairwise, over and over, and a thousand notes fold down in about ten rounds instead of a thousand steps — and you get exactly the same answer, because you never changed *what* is computed, only *when*. Nothing is approximated.
+
+So the ball still moves note by note in principle, but the GPU works out where it lands without walking each step.
 
 # For experts:
 
 GSM is a fixed-dimensional state space model with a geometric inductive bias. The state `S ∈ R^N` evolves under a sequence of input-parameterized transformations rather than a learned autonomous dynamics matrix. The update rule at each step is:
 
 ```
-S' = gate ⊙ Rotate(scale ⊙ S + shift) + (1 - gate) ⊙ S
-S' = LayerNorm(S')
+a_t = gate ⊙ scale + (1 - gate)        folded affine multiplier
+b_t = gate ⊙ shift                     folded affine offset
+
+S_t = a_t ⊙ S_{t-1} + b_t              associative affine map
+readout_t = LayerNorm(Rotate(S_t, Σ_{i≤t} θ_i))
 ```
 
-where `scale`, `shift`, `gate ∈ R^N` and the rotation angles `θ ∈ R^{n_pairs}` are all outputs of a 6-layer residual MLP — TransformNet — conditioned on the current token embedding. Nothing in the update rule is autonomous: `S` has no direct recurrence through a fixed weight matrix. It only moves when a token moves it, and the direction and magnitude of movement are entirely input-determined.
+where `scale`, `shift`, `gate ∈ R^N` and the rotation angles `θ ∈ R^{n_pairs}` are all outputs of a 6-layer residual MLP — TransformNet — conditioned on the current token embedding.
+
+This factoring is what makes the model parallelizable, and it is a deliberate departure from the earlier formulation `S' = LayerNorm(gate ⊙ Rotate(scale ⊙ S + shift) + (1-gate) ⊙ S)`. Two changes: LayerNorm and rotation are moved *out* of the recurrence and applied to a readout snapshot, so the quantity actually threaded through time is the bare affine state. Composition of affine maps is associative, so the whole sequence resolves by scan (see [Parallelization](#parallelization)); LayerNorm inside the loop would destroy that, since it is nonlinear and does not compose.
+
+Rotation can be lifted out because it is applied *after* the affine part rather than interleaved with it, and rotations in a fixed 2-D subspace compose additively in angle — so the cumulative rotation at step `t` is just the prefix sum of angles. Nothing in the update rule is autonomous: `S` has no direct recurrence through a fixed weight matrix. It only moves when a token moves it, and the direction and magnitude of movement are entirely input-determined.
 
 **The rotation component** is the architecturally novel piece. A fixed set of `n_pairs` random index pairs `(i, j) ⊂ [N]²` are sampled at initialization and frozen. For each pair, TransformNet produces an angle `θ_k`, and a 2D rotation is applied in that subspace:
 
@@ -63,17 +74,23 @@ where `scale`, `shift`, `gate ∈ R^N` and the rotation angles `θ ∈ R^{n_pair
 
 All pairs are computed in parallel via gather/scatter. This is a sparse approximation to a full SO(N) group action — the model learns to compose subspace rotations to implement semantic transformations. It's isometric by construction, which acts as an implicit norm-preserving regularizer on the state trajectory before the gate mixing and LayerNorm.
 
+**Stability without the per-step norm.** Removing LayerNorm from the recurrence removes a safety net, and this has a concrete consequence: `scale` is bounded to `(0, 1)`, not `(0, 2)` as in the earlier formulation. With the per-step norm gone, the folded multiplier `a_t` compounds multiplicatively across the entire sequence, so any `a_t > 1` grows without bound. Constraining `scale < 1` makes `a_t = gate·scale + (1-gate)` a convex combination of `scale` and `1`, hence in `(0, 1]` — the composed multiplier over any span is a product of terms `≤ 1` and cannot expand. Measured with a `(0, 2)` range, the state reaches ~`e^69` by 100 tokens and overflows fp32 well before a 512-token sequence finishes. This bound is not a tuning choice; it is what keeps the no-clipping stability property true.
+
 **Relation to SSMs.** GSM superficially resembles S4/Mamba in maintaining a fixed-size latent state, but the similarity is shallow. SSMs parameterize a linear dynamical system `S' = AS + Bx` where `A` is a structured matrix (diagonal-plus-low-rank, HiPPO-initialized) optimized to capture long-range dependencies through careful eigenspectrum control. The input modulates the input projection `B` and sometimes `Δ` (discretization step), but the core dynamics matrix `A` is fixed or input-independent.
 
 GSM has no autonomous dynamics at all. The entire transformation — including what would correspond to `A` — is a function of the input. This is a stronger form of input-conditioning and removes the need for eigenspectrum engineering, but it also means the model can't learn input-independent temporal dynamics. Whether that's a limitation or a feature depends on the domain.
 
 **Relation to GRUs.** The gate mechanism `S' = gate ⊙ S_new + (1 - gate) ⊙ S` is structurally identical to a GRU update gate, and the shift/scale is analogous to the candidate hidden state. The difference is that a GRU computes its candidate via `tanh(W_h · (r ⊙ h) + W_x · x)` — a fixed recurrent projection `W_h` applied to the gated previous state. GSM replaces this entirely: there is no `W_h`, and the candidate state is produced by a geometric operation (rotation in random subspaces) rather than a linear projection. The inductive bias shifts from "linear memory compression" to "isometric geometric deformation."
 
-**The parallelization constraint.** The sequential dependency `S_t = f(S_{t-1}, x_t)` makes the recurrence irreducibly sequential — you can't parallelize across time the way transformers can with attention. However, TransformNet — which is the dominant compute cost — has no dependency on `S`. Given the full embedding sequence `E ∈ R^{B×T×d}`, all `T` TransformNet calls can be batched as a single `[B·T, d]` forward pass, producing all transformation parameters in one matmul. The recurrence then runs as a cheap sequential loop over elementwise ops. This gives 2–3× inference speedup at the cost of larger intermediate tensors, and is the correct parallelization given the architecture's constraints.
+**Parallelization.** Two independent facts combine here. First, TransformNet — the dominant compute cost — has no dependency on `S`, so all `T` calls batch into a single `[B·T, d]` matmul. Second, and this is the part that used to be missing, the state recurrence itself is no longer sequential: with the update written as an affine map, composition is associative and the whole sequence resolves by parallel scan in O(log T) depth. There is no Python loop over time in the forward pass at all.
+
+The earlier claim that the recurrence was "irreducibly sequential" was wrong — it was a property of the chosen formulation (per-step LayerNorm, interleaved rotation), not of the architecture. Refactoring the update to expose an associative operator removes the constraint entirely.
 
 **Why it works on small datasets.** The geometric inductive bias imposes strong structure on the hypothesis space. Subspace rotations are a highly constrained family of transformations — the model can't implement arbitrary state transitions, only isometric deformations followed by gated mixing. On a small corpus like 228 MIDI files, this constraint acts as an implicit regularizer that prevents the kind of memorization a less constrained model would fall into. The state trajectory is forced to encode structure geometrically, and geometric structure generalizes better than memorized token sequences when data is scarce.
 
-**Open questions.** Whether the random fixed subspace pairs are the right structure — versus learned pairs, full dense rotations, or a hierarchical decomposition — is unexplored. The initialization of `S_0` as a learned parameter rather than zero or a fixed point is also non-obvious; it means the model learns a "prior geometric position" that all sequences start from. The LayerNorm after each step keeps the state on a roughly unit hypersphere, which combined with the isometric rotations suggests the effective geometry is closer to spherical than flat — despite the architecture operating in flat R^N.
+**Open questions.** Whether the random fixed subspace pairs are the right structure — versus learned pairs, full dense rotations, or a hierarchical decomposition — is unexplored. The initialization of `S_0` as a learned parameter rather than zero or a fixed point is also non-obvious; it means the model learns a "prior geometric position" that all sequences start from.
+
+Moving LayerNorm out of the recurrence changes the state geometry in a way that has not been characterized empirically. Previously the per-step norm held the state on a roughly unit hypersphere, which combined with the isometric rotations made the effective geometry closer to spherical than flat. Now the threaded state is bare affine and contracting (`a_t ≤ 1`), with normalization applied only at readout — so the internal trajectory is free to shrink toward the origin over long sequences even though the readout stays normalized. Whether that contraction costs long-range expressivity in practice, and whether the readout norm fully compensates, is the main open question introduced by the scan reformulation.
 ---
 
 ## Why It's Different From An RNN
@@ -88,6 +105,7 @@ This is the question worth answering carefully, because the surface structure lo
 | Geometric op    | None                          | Vectorized subspace rotations       |
 | Inductive bias  | Sequential memory compression | Geometric deformation               |
 | Long-range      | Vanishing gradient problem    | Gate controls deformation magnitude |
+| Training depth  | O(T) sequential               | O(log T) associative scan           |
 
 The critical difference: RNNs have a **fixed recurrent weight matrix W_hh** that maps state to state regardless of input. In GSM, the transformation of the state is **entirely parameterized by the input token**. The state has no direct path to itself — it only moves when a token moves it, and how it moves depends entirely on what the token is.
 
@@ -98,18 +116,25 @@ The subspace rotation component has no RNN analogue at all. It applies learned r
 ## Architecture
 
 ```
-Token t
-  └─ Embedding lookup → e_t ∈ R^{embed_dim}
-       └─ TransformNet (6-layer MLP with residual connections)
-            ├─ scale  ∈ R^{state_dim}    multiplicative field
+All tokens t = 1..T, in parallel
+  └─ Embedding lookup → E ∈ R^{B×T×embed_dim}
+       └─ TransformNet (6-layer MLP, one batched [B·T, d] matmul)
+            ├─ scale  ∈ R^{state_dim}    multiplicative field, bounded (0,1)
             ├─ shift  ∈ R^{state_dim}    additive perturbation
             ├─ gate   ∈ R^{state_dim}    geometric mixing coefficient
             └─ angles ∈ R^{n_pairs}      subspace rotation angles
-                 └─ RotarySubspaceTransform (vectorized, all pairs parallel)
-                      └─ S' = gate ⊙ Rotate(scale ⊙ S + shift) + (1 - gate) ⊙ S
-                           └─ LayerNorm → bounded manifold position
-                                └─ Decoder (3-layer MLP) → logits ∈ R^{vocab_size}
+                 │
+                 ├─ fold → a = gate⊙scale + (1-gate),  b = gate⊙shift
+                 │    └─ associative scan over (a, b)      O(log T) depth
+                 │         (a₂,b₂)∘(a₁,b₁) = (a₂a₁, a₂b₁+b₂)
+                 │         └─ S = a ⊙ S₀ + b                all t at once
+                 │
+                 └─ cumsum(angles) → RotarySubspaceTransform (all pairs parallel)
+                      └─ LayerNorm → bounded manifold position
+                           └─ Decoder (3-layer MLP) → logits ∈ R^{vocab_size}
 ```
+
+Generation uses the same math one token at a time: `GeometricStateStep.step()` carries `(S_raw, angle_acc)` — the pre-rotation, pre-norm state plus accumulated angle — and applies rotation and LayerNorm to a snapshot for readout without feeding them back. This is what keeps sampling consistent with training.
 
 ### The High-Dimensional Plane
 
@@ -143,51 +168,52 @@ There is no classical sequence model operation that corresponds to input-paramet
 
 ## Parallelization
 
-GSM's forward pass splits cleanly into two phases with different parallelism characteristics:
+There is a single forward path, and it has no loop over time. `model.train()` and `model.eval()` no longer select different implementations.
 
-**TransformNet** — the 6-layer MLP that maps embeddings to transformation parameters — has no dependency on the state `S`. All `seq_len` token embeddings can be processed simultaneously in a single batched matmul: `[batch × seq_len, embed_dim]` instead of `seq_len` separate `[batch, embed_dim]` calls. This is the dominant compute cost and benefits fully from GPU parallelism.
+**TransformNet** — the 6-layer MLP that maps embeddings to transformation parameters — has no dependency on the state `S`. All `seq_len` token embeddings process simultaneously in one batched matmul. This is the dominant compute cost and benefits fully from GPU parallelism.
 
-**The recurrence** — applying scale, rotate, gate, and LayerNorm to update `S` — is inherently sequential: `S_t` depends on `S_{t-1}`. It runs as a Python loop over `seq_len` steps but only does cheap elementwise ops per step; the expensive MLP computation has already been done.
+**The recurrence** resolves by associative scan. Each token's update is folded into an affine map `S → a⊙S + b`, and two such maps compose as `(a₂,b₂)∘(a₁,b₁) = (a₂a₁, a₂b₁+b₂)` — associative, so a Hillis-Steele scan computes all `T` prefixes in `⌈log₂ T⌉` rounds of elementwise ops. Rotations compose additively in angle and are applied once via `cumsum`. The scan is exact, not an approximation.
 
-This gives two forward paths, selected automatically by `model.train()` / `model.eval()`:
+**Exactness.** Verified against a step-by-step reference at `T = 1, 2, 3, 7, 16, 17, 64, 100, 257, 512, 1024` (non-powers-of-two included, since the scan pads with the identity operator). In float64 the maximum disagreement is **5.1e-13 at T=512** and 7.1e-13 at T=1024 — algebraically exact. In float32 the same comparison drifts to ~4e-4 at T=512, which is accumulation rounding, not a logic difference.
 
-| Mode      | TransformNet          | Recurrence  | When used              |
-| --------- | --------------------- | ----------- | ---------------------- |
-| Training  | Per-step (small tensors, fast backward) | Sequential | `model.train()` |
-| Inference | Batched across full sequence (2–3× faster) | Sequential | `model.eval()` |
+**Measured cost** (RTX 5060 Ti, forward+backward, batch 8, state_dim 256, n_pairs 32, fp32):
 
-**Benchmark results** (RTX 5060 Ti, seq_len=256, bfloat16, no compile):
+| seq_len | Time per fwd+bwd |
+| ------- | ---------------- |
+| 64      | 5.8 ms           |
+| 128     | 5.9 ms           |
+| 256     | 6.3 ms           |
+| 512     | 6.9 ms           |
 
-| Metric                        | Original   | Optimized   | Speedup |
-| ----------------------------- | ---------- | ----------- | ------- |
-| Forward throughput (batch=32) | 38k tok/s  | 135k tok/s  | 3.6×    |
-| Forward throughput (batch=128)| 140k tok/s | 333k tok/s  | 2.4×    |
-| Latency p50 (batch=128)       | 246ms      | 104ms       | 2.4×    |
-| Training throughput (batch=32)| 9k tok/s   | 9k tok/s    | 1.0×    |
-| First-step latency            | 443ms      | 90ms        | 4.9×    |
+An 8× increase in sequence length costs 19% more time — the log-depth showing up in wall clock. The old sequential loop scaled linearly.
 
-Training throughput is identical to the original — the parallelization applies to inference and generation only, where it delivers 2–3× speedup. On Linux/WSL2 with `torch.compile` (TransformNet + decoder submodules), inference gains a further 10–30%.
+**Stability check.** 60 training steps at `seq_len=512` under fp16 AMP: loss 4.16 → 3.76, gradient norm ~2 with **no clipping applied**, state finite throughout (`max|S| = 4.14`). The contraction bound on `scale` is doing its job.
+
+> The earlier benchmark table in this section compared two variants of the sequential implementation (per-step vs. batched TransformNet, 2–3× on inference, 1.0× on training). Both are gone, so those numbers no longer describe any code path in the repo and have been removed rather than left to mislead.
+
+On Linux/WSL2, `torch.compile` on TransformNet and the decoder gives a further 10–30%.
 
 ---
 
 ## Training Tradeoffs
 
-GSM's O(1) inference property comes with a training dynamic that is important to understand.
+The training forward pass is no longer a loop over sequence length, so the main tradeoff described here previously — slow wall-clock training from sequential state evolution — no longer applies. Training cost is now roughly flat in sequence length (see [Parallelization](#parallelization)).
 
-The state update is strictly sequential — each step depends on the previous one, so the training forward pass is a loop over sequence length. This means:
+What remains:
 
-* **Small datasets (<10k sequences):** The Bach corpus trains in ~54 minutes.
-* **Large datasets (millions of sequences):** Slower wall-clock training due to sequential state evolution per token.
 * **`torch.compile`** improves throughput on Linux/WSL2 by fusing TransformNet and decoder kernels. Not available on native Windows (no Triton), enabled automatically when detected.
-* **Custom CUDA kernels** could parallelize sequence dynamics further, but are intentionally avoided to preserve simplicity and portability.
+* **Custom CUDA kernels** would still help — the scan is written in pure PyTorch and materializes `⌈log₂ T⌉` intermediate tensors. A fused kernel would cut memory traffic. Avoided so far to preserve simplicity and portability.
+* **Memory** is the new axis to watch: the scan holds `[B, T, state_dim]` tensors rather than one `[B, state_dim]` state, so a step that was O(1) in memory during the recurrence is now O(T). At `state_dim=4096` and long sequences this can bind before compute does.
 
-The fundamental tradeoff: **training cost scales with dataset size; inference cost does not.**
+Training cost still scales with dataset size; inference cost does not.
 
 A key empirical result: **GSM learns effectively from very small datasets.** On just 228 Bach MIDI files, it produces coherent, stylistically consistent baroque output.
 
 ---
 
 ## Results
+
+> **These results predate the scan reformulation** and were produced by the older sequential recurrence (per-step LayerNorm, interleaved rotation, `scale ∈ (0,2)`). They are kept as the historical record of what the architecture achieved, but they have not been reproduced under the current update rule. Treat the loss curve as indicative of the approach, not as a benchmark of the code as it now stands.
 
 **Hardware**: RTX 5060 Ti (16GB VRAM)
 **Dataset**: 228 Bach MIDI files (217 processed, 11 skipped), 3,357 training sequences
@@ -227,6 +253,12 @@ pip install torch pretty_midi miditok tqdm rich nvidia-ml-py psutil
 ```
 
 Requires Python 3.10+. GPU strongly recommended (CUDA). Tested on Windows 11 and WSL2 with RTX 5060 Ti.
+
+### Existing checkpoints
+
+⚠️ **Checkpoints trained before the scan reformulation will load without error but will not work correctly.** Parameter shapes are unchanged, so `load_state_dict` accepts them silently, but they were trained under a different recurrence (per-step LayerNorm, interleaved rotation, `scale ∈ (0,2)`). Nothing in a checkpoint file records which update rule produced it.
+
+If a loaded model produces garbage for no apparent reason, this is the first thing to check. Retrain rather than attempting to port — there is no weight transformation that converts between the two recurrences.
 
 ---
 
@@ -321,14 +353,14 @@ At 0.75 temperature, outputs are **stylistically stable baroque compositions** s
 
 ### 5. Benchmark
 
-Compare original vs optimized forward/training throughput:
+Compare the scan model against the older sequential recurrence, which `benchmark_compare.py` keeps its own self-contained copy of as a baseline:
 
 ```cmd
 python benchmark_compare.py
 python benchmark_compare.py --trials 20 --seq_len 512
 ```
 
-Original architecture benchmark (O(1) inference scaling confirmation):
+O(1) inference scaling confirmation:
 
 ```cmd
 python benchmark.py --checkpoint checkpoints/latest.pt --vocab_path vocab.json

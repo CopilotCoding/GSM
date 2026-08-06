@@ -157,10 +157,10 @@ def generation_worker(model, id_to_str, device, cfg, args, note_queue, stop_even
     prompt = torch.tensor(ids, dtype=torch.long, device=device)
 
     with torch.no_grad():
-        S = model.S0.unsqueeze(0).clone()
+        carry = model.step.init_carry(model.S0, 1)
         E = model.embedding(prompt.unsqueeze(0))
         for t in range(prompt.shape[0]):
-            S = model.step(S, E[:, t])
+            carry, S = model.step.step(carry, E[:, t])
 
     print(f"[gen] Prompt: {ids}  →  generating…")
 
@@ -171,9 +171,9 @@ def generation_worker(model, id_to_str, device, cfg, args, note_queue, stop_even
                 print("[gen] Reached max_tokens.")
                 break
 
-            e      = model.embedding(torch.tensor([[ids[-1]]], device=device)).squeeze(1)
-            S      = model.step(S, e)
-            logits = model.decoder(S) / args.temperature
+            e          = model.embedding(torch.tensor([[ids[-1]]], device=device)).squeeze(1)
+            carry, S   = model.step.step(carry, e)
+            logits     = model.decoder(S) / args.temperature
 
             if args.top_k > 0:
                 top_vals, _ = torch.topk(logits, args.top_k)
