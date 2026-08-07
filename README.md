@@ -8,7 +8,48 @@ POTENTIAL USE CASE IS STREAMING TRAINING AND INFERENCE AT THE SAME TIME ONLINE L
 
 Scales to 179k+ file datasets with memory-mapped binary packing — no architecture changes required.
 
-⚠️ **The scan model has not been trained to convergence yet.** The Bach results this README previously led with — 228 files, 54 minutes, final loss 0.1196, convincing baroque output — were produced by the older sequential recurrence, which has since been replaced. They are preserved in [Results](#results) as the historical record of the approach, but they do not describe the current code and have not been reproduced under it. What is currently verified for the scan: exactness against a step-by-step reference, stability without gradient clipping at seq_len 512, and a 60-step smoke test where loss decreases. Convergence quality and generation quality are open.
+---
+
+## What Is Actually Verified
+
+Separating what has been measured from what is asserted. Every claim below is reproducible with a script in this repo.
+
+### Verified true
+
+| Claim | Evidence |
+| ----- | -------- |
+| The scan is algebraically exact | 5.1e-13 max deviation from step-by-step reference in float64 at T=512; verified at T = 1…1024 including non-powers-of-two |
+| Training is ~6× faster | 54k tok/s at seq_len 512 vs. 9k tok/s recorded for the sequential version at seq_len 256 |
+| Cost is near-flat in sequence length | 8× longer sequences cost 19% more time (5.8ms → 6.9ms) |
+| Stable without gradient clipping | 70 epochs at seq_len 512 under fp16 AMP, no NaN/inf, gradient norm ~2 |
+| Generation matches training semantics | Incremental `step()` agrees with the parallel scan to fp32 rounding |
+
+### Verified false, or unsupported
+
+| Previous claim | What measurement shows |
+| -------------- | ---------------------- |
+| "Generates convincing baroque piano music" | Generated samples are **60–96% verbatim copies** of single training pieces (`check_memorization.py`, 8/8 samples flagged across two independent generation paths) |
+| "Knowledge is shaped into the geometry" | Zeroing the state mid-sequence changes **0.8%** of subsequent predictions. The state is nearly decorative in the trained model. |
+| "Accumulates context geometrically" / O(1) long-range memory | Effective memory horizon is **~19 tokens**. The learned multiplier drives the state's own history to `e^-358` over 512 tokens — it is a short-window model, not a long-context one. |
+| "Geometric bias prevents memorization on small data" | The opposite was observed on exactly the dataset used to support the claim. |
+| "GSM learns effectively from very small datasets" | It memorized 202 files. Whether it *learns* from them is untested. |
+
+### Not yet tested
+
+Generalization of any kind. There is **no held-out validation split** in `train.py`, so every loss number in this README is training loss and none of them measure learning. Whether the architecture can generalize when trained with early stopping, more data, or regularization is genuinely open — the memorization result is evidence about this training run, not proof the approach cannot work.
+
+Reproduce with:
+
+```cmd
+python check_memorization.py                        # copying vs. training data
+python capture_live.py && python check_memorization.py --generated generated_live
+```
+
+⚠️ **This architecture has not been shown to work.** A trained checkpoint (loss 0.0121, 70 epochs on 228 Bach files) was measured and found to **reproduce training data verbatim** — generated samples are 60–96% contiguous copies of single training pieces. Worse, ablation shows the geometric state is **not carrying information**: zeroing it mid-sequence changes 0.8% of subsequent predictions, and its effective memory horizon is ~19 tokens. See [What Is Actually Verified](#what-is-actually-verified).
+
+What *is* verified is the scan reformulation itself: it is algebraically exact (5.1e-13 in float64 at T=512), trains ~6× faster than the sequential version, and is numerically stable without gradient clipping. Those are claims about the *implementation*, not about the architecture learning anything.
+
+The Bach results this README previously led with — 54 minutes, loss 0.1196, "convincing baroque piano music" — came from the older sequential recurrence and were never tested for memorization. Given that the current model memorizes on the same corpus, **those results should be assumed to reflect copying as well** until someone checks. They are preserved in [Results](#results) as a historical record only.
 
 ---
 
@@ -16,11 +57,11 @@ Scales to 179k+ file datasets with memory-mapped binary packing — no architect
 
 Most sequence models treat context as something to *store* — transformers cache every previous token's keys and values, RNNs overwrite a memory buffer. Both approaches scale poorly: transformers pay quadratic cost in sequence length, RNNs struggle with long-range dependencies.
 
-GSM treats context as something to *accumulate geometrically*.
+GSM is an attempt to treat context as something to *accumulate geometrically*.
 
-The model maintains a single fixed-size point `S ∈ R^N` — a position in a high-dimensional geometric space. Each token is not a data point to store but a **transformation operator** that deforms that geometry. The state is never a memory buffer being overwritten. It's a manifold position being continuously reshaped by a learned transformation algebra.
+The model maintains a single fixed-size point `S ∈ R^N` — a position in a high-dimensional geometric space. Each token is not a data point to store but a **transformation operator** that deforms that geometry. The intent is that the state is never a memory buffer being overwritten, but a manifold position continuously reshaped by a learned transformation algebra.
 
-Knowledge isn't stored. It's shaped into the geometry.
+That is the design intent. In the one trained model measured so far, it did not happen: the state's contribution decays to nothing within ~19 tokens, and the model reproduces training data rather than composing. See [What Is Actually Verified](#what-is-actually-verified). Read the rest of this section as a description of the architecture's design, not of demonstrated behavior.
 
 # For beginners:
 
@@ -36,13 +77,15 @@ By the end of the piece, the ball is sitting somewhere specific in that enormous
 
 When the model wants to predict the next note, it just looks at where the ball is sitting right now and asks: given this position in this space, what note comes next?
 
-**Why does this work?**
+**Why might this work?**
 
-In a space with 4096 dimensions, you have an almost incomprehensible amount of room to encode structure. Musical patterns — a chord progression, a rhythmic motif, a harmonic resolution — each carve out a characteristic trajectory through that space during training. The model learns which pushes and rotations correspond to which musical events, so that similar musical contexts end up moving the ball to similar regions.
+In a space with 4096 dimensions, there is an enormous amount of room to encode structure. The hope is that musical patterns — a chord progression, a rhythmic motif, a harmonic resolution — each carve out a characteristic trajectory through that space during training, so that similar musical contexts move the ball to similar regions.
 
-You're not storing the music. You're letting the music reshape a geometry, and trusting that geometry to remember what matters.
+The idea is to not store the music, but let the music reshape a geometry, and trust that geometry to remember what matters.
 
-**The key property:** each note takes exactly the same amount of compute to process, and the ball stays the same size regardless of how long the piece is. There's no growing list, no quadratic blowup. O(1) per token, forever.
+**Whether it does is a separate question, and so far the answer is no.** In the trained model measured here, the ball's position stops mattering after about 19 notes — you can pick it up and move it somewhere completely different mid-piece and the model carries on as if nothing happened. It turned out to be predicting mostly from the last few notes and reciting pieces it had seen. The architecture permits the behavior described above; it does not compel it, and nothing has yet made it happen.
+
+**The compute property is real and unaffected:** each note takes the same amount of compute, and the ball stays the same size regardless of how long the piece is. No growing list, no quadratic blowup. That much holds regardless of how well the model learns.
 
 **What about training speed?** This used to be the catch. Because each step depends on the previous position of the ball, the obvious way to train is one note at a time — no parallelism, slow on a GPU.
 
@@ -88,7 +131,11 @@ GSM has no autonomous dynamics at all. The entire transformation — including w
 
 The earlier claim that the recurrence was "irreducibly sequential" was wrong — it was a property of the chosen formulation (per-step LayerNorm, interleaved rotation), not of the architecture. Refactoring the update to expose an associative operator removes the constraint entirely.
 
-**Why it works on small datasets.** The geometric inductive bias imposes strong structure on the hypothesis space. Subspace rotations are a highly constrained family of transformations — the model can't implement arbitrary state transitions, only isometric deformations followed by gated mixing. On a small corpus like 228 MIDI files, this constraint acts as an implicit regularizer that prevents the kind of memorization a less constrained model would fall into. The state trajectory is forced to encode structure geometrically, and geometric structure generalizes better than memorized token sequences when data is scarce.
+**Small datasets — a hypothesis that failed its first test.** The argument was: subspace rotations are a highly constrained family of transformations, so the model can't implement arbitrary state transitions, only isometric deformations followed by gated mixing. On a small corpus this constraint should act as an implicit regularizer preventing the memorization a less constrained model would fall into.
+
+Measurement contradicts this. On 228 Bach files the model memorized thoroughly — 60–96% verbatim reproduction — and did it *by routing around the geometry*: the learned gate drives the state's contribution to `e^-358` over 512 tokens, reducing the model to a short-window token map with a 32M-parameter lookup behind it. The rotation constraint doesn't bind, because the model isn't relying on the state at all.
+
+The flaw in the original argument is that it constrains *how the state evolves* while saying nothing about capacity. The state is a pointer, not the store; 32M parameters in TransformNet are where a corpus this size actually fits. A fixed-size state bounds how much context can be live at once — not how much the model can memorize. Those are independent quantities, and this README previously conflated them.
 
 **Open questions.** Whether the random fixed subspace pairs are the right structure — versus learned pairs, full dense rotations, or a hierarchical decomposition — is unexplored. The initialization of `S_0` as a learned parameter rather than zero or a fixed point is also non-obvious; it means the model learns a "prior geometric position" that all sequences start from.
 
@@ -106,7 +153,7 @@ This is the question worth answering carefully, because the surface structure lo
 | Transformation  | Fixed recurrent weight matrix | Input-parameterized field           |
 | Geometric op    | None                          | Vectorized subspace rotations       |
 | Inductive bias  | Sequential memory compression | Geometric deformation               |
-| Long-range      | Vanishing gradient problem    | Gate controls deformation magnitude |
+| Long-range      | Vanishing gradient problem    | Gate *can* control deformation magnitude — in the trained model it learned to discard state within ~19 tokens |
 | Training depth  | O(T) sequential               | O(log T) associative scan           |
 
 The critical difference: RNNs have a **fixed recurrent weight matrix W_hh** that maps state to state regardless of input. In GSM, the transformation of the state is **entirely parameterized by the input token**. The state has no direct path to itself — it only moves when a token moves it, and how it moves depends entirely on what the token is.
@@ -166,6 +213,8 @@ There is no classical sequence model operation that corresponds to input-paramet
 | Scales to any corpus | ✓                  | ✓        | ✓        |
 | Long context cost    | Quadratic          | Linear   | **O(1)** |
 
+These are costs, not capabilities. O(1) memory per token says nothing about how much context the model actually *uses*: in the trained checkpoint measured here the effective horizon was ~19 tokens, so the fixed-size state was cheap precisely because it was carrying almost nothing. A model that ignores its state has excellent memory complexity and no memory.
+
 ---
 
 ## Parallelization
@@ -209,13 +258,13 @@ What remains:
 
 Training cost still scales with dataset size; inference cost does not.
 
-A key empirical result from the sequential recurrence: **GSM learned effectively from very small datasets** — on just 228 Bach MIDI files it produced coherent, stylistically consistent baroque output. Whether the scan formulation retains that small-data property is untested; the geometric inductive bias argument for it is unchanged, but the argument is not evidence.
+This README previously claimed GSM "learns effectively from very small datasets," citing coherent baroque output from 228 files. That claim is withdrawn. The scan model trained on the same corpus reproduces training pieces verbatim rather than composing, and the sequential result it was based on was never checked for memorization — the tooling to check ([check_memorization.py](check_memorization.py)) did not exist until after that claim was written.
 
 ---
 
 ## Results
 
-> **These results predate the scan reformulation** and were produced by the older sequential recurrence (per-step LayerNorm, interleaved rotation, `scale ∈ (0,2)`). They are kept as the historical record of what the architecture achieved, but they have not been reproduced under the current update rule. Treat the loss curve as indicative of the approach, not as a benchmark of the code as it now stands.
+> ⚠️ **These numbers do not demonstrate that the model learned to compose.** They predate the scan reformulation and were produced by the older sequential recurrence (per-step LayerNorm, interleaved rotation, `scale ∈ (0,2)`). More importantly, they are **training** losses with no held-out split, and the output was never checked for memorization. When the current model was trained on this same corpus and checked, it reproduced training pieces verbatim. The qualitative descriptions below ("convincing baroque piano music", "coherent composition structure") describe output that was listened to but not tested for copying, and should be read with that in mind. Kept as a historical record.
 
 **Hardware**: RTX 5060 Ti (16GB VRAM)
 **Dataset**: 228 Bach MIDI files (217 processed, 11 skipped), 3,357 training sequences
@@ -349,7 +398,11 @@ Key arguments:
 python -m generate.generate --checkpoint checkpoints/latest.pt --vocab_path vocab.json --out_dir generated --n_samples 5 --length 512 --temperature 0.75
 ```
 
-At 0.75 temperature the sequential-recurrence model produced stylistically stable baroque compositions suitable for direct listening in MIDI DAWs. Output quality under the scan formulation has not been evaluated — that temperature is a reasonable starting point, not a tuned recommendation.
+⚠️ Check generated output before treating it as composition. At temperature 0.75 the current checkpoint emits near-verbatim copies of training pieces (mean 90.7% contiguous overlap). Raising temperature to 0.9 reduces but does not eliminate this (mean 63.4%). Always run:
+
+```cmd
+python check_memorization.py --generated generated
+```
 
 ---
 
@@ -383,6 +436,39 @@ python plot_training.py checkpoints/training_log.csv
 ```cmd
 python test.py
 ```
+
+---
+
+### 8. Validate what the model actually learned
+
+Loss cannot tell you whether a model learned or memorized, and it cannot tell you whether the geometric state is being used. These two tools can. **Run both before believing any result from this repo.**
+
+```cmd
+python check_memorization.py                     # is output copied from training data?
+python probe_state.py                            # does the state carry information?
+```
+
+`check_memorization.py` measures, per generated sample, the longest verbatim token run shared with any training file, plus n-gram coverage and novelty, plus self-similarity between samples (mode collapse). Compares in token space so MIDI round-tripping cannot distort it.
+
+`probe_state.py` reports the learned gate/multiplier statistics, the effective memory horizon, and — the decisive test — what fraction of predictions change when the state is zeroed, noised, or shuffled mid-sequence. High agreement means the state is decorative.
+
+To check the live-playback path (which uses the incremental `step()`, different code from training's scan):
+
+```cmd
+python capture_live.py                                          # headless play_live
+python check_memorization.py --generated generated_live
+```
+
+Useful options:
+
+| Flag | Tool | Notes |
+| ---- | ---- | ----- |
+| `--generated`, `--dataset` | check_memorization | directories to compare |
+| `--ngram`, `--min-run` | check_memorization | match lengths (default 8, 12) |
+| `--json` | check_memorization | write a machine-readable report |
+| `--checkpoint` | probe_state, capture_live | probe an earlier epoch to find where copying begins |
+| `--corrupt-at` | probe_state | step at which to ablate the state |
+| `--temperature`, `--top_k` | capture_live | defaults mirror `play_live.py` |
 
 ---
 
@@ -436,9 +522,11 @@ A generation thread steps the GSM one token at a time and decodes REMI tokens in
 
 ## The Geometric Intuition
 
-High-dimensional flat space behaves as a structured representational medium under learned transformation dynamics. In 4096 dimensions, semantic regions emerge as stable attractors of repeated transformation sequences. Over training, musical structure is not stored explicitly but encoded as persistent geometric trajectories in state space.
+The intuition motivating the design: high-dimensional flat space behaves as a structured representational medium under learned transformation dynamics. In 4096 dimensions, semantic regions might emerge as stable attractors of repeated transformation sequences, so that musical structure is encoded as persistent geometric trajectories rather than stored explicitly.
 
-You do not retrieve memory. You evolve a system into a region of structured behavior.
+The aspiration is to evolve a system into a region of structured behavior rather than retrieve memory.
+
+What was measured instead is retrieval: a random 4-token prompt selects a memorized piece, which is then replayed near-verbatim, while the state itself decays to irrelevance within ~19 tokens. The intuition above remains a hypothesis. It has been tested once and it did not hold.
 
 ---
 

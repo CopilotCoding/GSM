@@ -1,12 +1,42 @@
 # Geometric State Machine (GSM): A Novel Sequence Architecture Built on Fixed-Manifold Transformation Algebras
 
-*Invented May 24, 2026. Trained on Bach. Sounds like Bach.*
+*Invented May 24, 2026. Trained on Bach. Reproduces Bach — see correction below.*
+
+---
+
+> ## ⚠️ Correction — subsequent measurement contradicts this paper's central claims
+>
+> This paper was written before the model's output was tested for memorization or the
+> state tested for information content. Both have since been measured, and the results
+> are negative:
+>
+> - **Generated output is copied, not composed.** Samples from a trained checkpoint are
+>   60–96% contiguous verbatim reproductions of single training pieces (8/8 samples, two
+>   independent generation paths). The "sounds convincingly like Bach" observation in the
+>   abstract is consistent with the model replaying Bach.
+> - **The geometric state carries almost no information.** Zeroing it mid-sequence changes
+>   0.8% of subsequent predictions. Its effective memory horizon is ~19 tokens; the learned
+>   multiplier drives the state's own history to `e^-358` over 512 tokens.
+> - **Every loss figure here is training loss.** No held-out split existed. Section 8 lists
+>   "implement proper train/validation split to measure generalization vs. memorization"
+>   as future work; that measurement has now been done and the model memorizes.
+>
+> The architecture's *cost* properties (O(1) memory and compute per token) are real and
+> unaffected. Its *capability* claims — that context accumulates in the geometry, that
+> knowledge is shaped into the manifold — are unsupported by any measurement and
+> contradicted by the ablation above. Sections below are preserved as originally written;
+> read them as hypotheses, not findings. Reproduce with `probe_state.py` and
+> `check_memorization.py`.
+>
+> A separate change since publication: the sequential recurrence described in §3 has been
+> replaced by an equivalent-in-spirit parallel associative scan, which required moving
+> LayerNorm and rotation out of the recurrence and bounding `scale` to (0,1). See README.
 
 ---
 
 ## Abstract
 
-We introduce the Geometric State Machine (GSM), a sequence modeling architecture that abandons the fundamental premise shared by every major existing approach — that context must be stored. Instead of accumulating keys, values, or hidden states that grow with sequence length, GSM maintains a single fixed-size point in a high-dimensional geometric space and treats each token as a learned transformation operator that deforms that geometry. The result is a model with O(1) memory and compute per token at any sequence length, no KV cache, no quadratic attention, and no recurrent weight matrix. Trained on 228 Bach MIDI files in under an hour on a single consumer GPU, GSM produces music that listeners describe as sounding convincingly like Bach at epoch 47, with loss still falling at epoch 100. This paper describes the architecture, its theoretical motivation, its relationship to and divergence from existing approaches, and the substantial unexplored potential of the design.
+We introduce the Geometric State Machine (GSM), a sequence modeling architecture that abandons the fundamental premise shared by every major existing approach — that context must be stored. Instead of accumulating keys, values, or hidden states that grow with sequence length, GSM maintains a single fixed-size point in a high-dimensional geometric space and treats each token as a learned transformation operator that deforms that geometry. The result is a model with O(1) memory and compute per token at any sequence length, no KV cache, no quadratic attention, and no recurrent weight matrix. Trained on 228 Bach MIDI files in under an hour on a single consumer GPU, GSM reaches a training loss of 0.1196 and produces music that listeners describe as sounding convincingly like Bach at epoch 47. **This last observation does not survive scrutiny: later measurement shows generated output is largely verbatim reproduction of training pieces, and that the geometric state contributes almost nothing to prediction (see Correction above).** This paper describes the architecture, its theoretical motivation, and its relationship to existing approaches. Its claims about what the geometry accomplishes should be read as untested hypotheses.
 
 ---
 
@@ -259,13 +289,21 @@ Innovation under constraint is not a poetic observation. It is a precise descrip
 
 ## 12. Conclusion
 
-The Geometric State Machine demonstrates that the storage-based assumption underlying all major sequence architectures is not necessary. Context can be represented as accumulated geometric deformation of a fixed manifold point. Tokens can be transformation operators rather than data to be stored. Knowledge can be shaped into geometry rather than written into memory.
+The Geometric State Machine *proposes* that the storage-based assumption underlying major sequence architectures is not necessary — that context might be represented as accumulated geometric deformation of a fixed manifold point, tokens as transformation operators, knowledge shaped into geometry rather than written into memory.
 
-The result is a model that is:
-- **O(1) per token** in both memory and compute
-- **Architecturally novel** — the input-parameterized subspace rotations have no precedent in the sequence modeling literature
-- **Practically efficient** — 32M parameters, consumer GPU, 45 minutes to Bach
-- **Theoretically rich** — the geometric framing opens interpretability, continual learning, and infinite-context applications that are architecturally intractable for transformers
+**This paper does not demonstrate that proposal.** The evidence offered was a training-loss curve and informal listening, neither of which can distinguish learning from memorization. When the distinguishing measurements were made (see Correction), the model was found to reproduce training data and to make almost no use of its geometric state.
+
+What the work does establish:
+- **O(1) per token** in both memory and compute — a real property of the architecture, independent of how well it learns
+- **Architecturally novel** — the input-parameterized subspace rotations have no precedent we are aware of in the sequence modeling literature
+- **Practically efficient to train** — 32M parameters, consumer GPU, under an hour on this corpus
+
+What remains unestablished:
+- That the geometry accumulates context. Measured horizon: ~19 tokens, with the state ablatable at 99.2% output agreement.
+- That the model generalizes at all. No held-out evaluation has been run.
+- That the interpretability, continual-learning, and infinite-context applications follow. Each assumes a state that carries information, which has not been observed.
+
+The honest summary is that the architecture is novel and cheap, and its central hypothesis is still untested — the one experiment run so far came back negative, on a setup (32M parameters, 1,535 sequences, no validation split, no early stopping) that makes memorization the expected outcome for almost any architecture.
 
 This was built in a single afternoon. The Bach it generates after 47 epochs of training is not the ceiling. It is the floor.
 
