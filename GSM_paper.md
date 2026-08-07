@@ -14,19 +14,33 @@
 >   60–96% contiguous verbatim reproductions of single training pieces (8/8 samples, two
 >   independent generation paths). The "sounds convincingly like Bach" observation in the
 >   abstract is consistent with the model replaying Bach.
-> - **The geometric state carries almost no information.** Zeroing it mid-sequence changes
->   0.8% of subsequent predictions. Its effective memory horizon is ~19 tokens; the learned
->   multiplier drives the state's own history to `e^-358` over 512 tokens.
+> - **The subspace rotation — this paper's central novelty (§4) — contributes nothing.**
+>   Disabling rotation entirely leaves predictions **100% identical** across 512 tokens.
+>   It acts on 128 pairs = 6.2% of 4096 dimensions, and cumulative angle reaches ~63 rad
+>   (≈10 full revolutions), so the decoder learned to ignore those dimensions. §4's claim
+>   that this operation "gives GSM its expressive power" is not supported.
+> - **The state is a short-window leaky integrator, not an accumulated manifold position.**
+>   Effective horizon ~19 tokens; predictions match full-history at a 32-token truncated
+>   context. Zeroing the state changes 0.8% of later predictions because it rebuilds within
+>   ~19 steps.
 > - **Every loss figure here is training loss.** No held-out split existed. Section 8 lists
 >   "implement proper train/validation split to measure generalization vs. memorization"
 >   as future work; that measurement has now been done and the model memorizes.
 >
+> **What the architecture reduces to.** With rotation inert, the recurrence is
+> `S ← a⊙S + b` with input-dependent diagonal `a ≈ 0.71` — a selective diagonal linear
+> recurrence, i.e. Mamba's core operation without HiPPO initialization or eigenspectrum
+> design. §2's characterization of SSMs as a distinct family, and §12's claim to have
+> escaped the storage-based paradigm, do not survive this: GSM as measured is a diagonal
+> SSM that omits the initialization theory, which is plausibly why its horizon is ~19
+> tokens.
+>
 > The architecture's *cost* properties (O(1) memory and compute per token) are real and
 > unaffected. Its *capability* claims — that context accumulates in the geometry, that
-> knowledge is shaped into the manifold — are unsupported by any measurement and
-> contradicted by the ablation above. Sections below are preserved as originally written;
-> read them as hypotheses, not findings. Reproduce with `probe_state.py` and
-> `check_memorization.py`.
+> knowledge is shaped into the manifold, that subspace rotation provides expressive power —
+> are unsupported by measurement and in the rotation's case directly contradicted. Sections
+> below are preserved as originally written; read them as hypotheses, not findings.
+> Reproduce with `probe_state.py` and `check_memorization.py`.
 >
 > A separate change since publication: the sequential recurrence described in §3 has been
 > replaced by an equivalent-in-spirit parallel associative scan, which required moving
@@ -96,6 +110,14 @@ The practical consequence: we don't need geodesics, parallel transport, or diffe
 
 ## 4. The Subspace Rotation: The Novel Geometric Heart
 
+> ⚠️ **Measurement contradicts this section.** Ablating rotation from a trained model leaves
+> predictions 100% identical over 512 tokens. The mechanism described below is real and is
+> computed; it simply carries no information the decoder uses. The claim later in this
+> section that this operation "gives GSM its expressive power" is unsupported. Two structural
+> causes, both addressable: rotation covers only 6.2% of state dimensions (128 pairs in
+> R^4096), and cumulative angle reaches ~63 rad — roughly ten full revolutions — placing it
+> far outside any informative range. Retained as written; see the Correction at the top.
+
 The most architecturally distinctive component of GSM is `RotarySubspaceTransform`.
 
 At initialization, we sample n_pairs random dimension pairs `(i, j)` from `{1, ..., N}` and fix them permanently. These are the rotation axes — structural geometry of the space, not learned parameters.
@@ -114,6 +136,12 @@ All pairs are computed simultaneously via gather/scatter — no Python loops, fu
 There is no operation in any RNN, transformer, or SSM that corresponds to this. RNNs have W_hh — a fixed matrix. Transformers have attention — a weighted average. SSMs have structured linear recurrences. None of these are input-parameterized geometric rotations in a fixed high-dimensional space.
 
 This is the operation that, we believe, gives GSM its expressive power despite its simplicity. The 128 rotation pairs with 4096 dimensions mean the model has 128 × 4096 = 524,288 different geometric axes along which any given token can deform the state. The learned transformation algebra carves the semantic structure of the training data into this space over the course of training.
+
+> **Correction.** Two errors here. The arithmetic: 128 pairs address 256 distinct
+> dimensions, not 524,288 axes — the pairs are fixed at initialization, so the model has
+> 128 rotation angles acting on 6.2% of the state, not half a million degrees of freedom.
+> And the belief about expressive power was never tested; when tested, ablating rotation
+> changed nothing.
 
 ---
 
@@ -152,7 +180,14 @@ A transformer attending over n cached tokens requires O(n) dot products per head
 
 ### Training
 
-Training cost per batch is O(seq_len) in the sequential step loop, with O(1) compute per step. This is unavoidable — you must process the sequence to learn from it. But unlike transformers, the seq_len cost is linear not quadratic, and unlike full-sequence SSMs with custom CUDA kernels, the implementation requires no specialized GPU operations beyond standard scatter/gather.
+Training cost per batch is O(seq_len) in the sequential step loop, with O(1) compute per step. This is unavoidable — you must process the sequence to learn from it.
+
+> **Correction: not unavoidable.** Folding each token into an affine map `S → a⊙S + b`
+> makes the update associative, so an associative scan resolves the sequence in O(log T)
+> depth. This is exact, not approximate (5.1e-13 in float64 at T=512), and measured ~6×
+> faster. It requires moving LayerNorm and rotation out of the recurrence — neither
+> composes — and bounding `scale` to (0,1) so the multiplier cannot expand. The sequential
+> dependency was a property of the chosen formulation, not of the architecture. But unlike transformers, the seq_len cost is linear not quadratic, and unlike full-sequence SSMs with custom CUDA kernels, the implementation requires no specialized GPU operations beyond standard scatter/gather.
 
 Total training cost scales as O(dataset_size × seq_len) — linear in both. The O(1) claim holds per token, per step.
 
@@ -273,6 +308,18 @@ Innovation under constraint is not a poetic observation. It is a precise descrip
 - Benchmark against Mamba on standard language modeling tasks
 - Train on LMD (178k MIDI files) to test generalization at scale
 - Implement proper train/validation split to measure generalization vs. memorization
+  — **done, and the result was negative**: the model memorizes (see Correction). A
+  validation split still needs to be added to `train.py`; the measurement was made
+  post-hoc with `check_memorization.py`.
+- **Make rotation matter.** Ablation shows it currently contributes nothing. Scale
+  `n_pairs` toward `state_dim / 2` so rotation covers the state rather than 6.2% of it,
+  and bound cumulative angle so it does not wrap ~10 times over a sequence.
+- **Investigate why the state is barely used.** A checkpoint sweep shows state usage
+  peaking near 7% at epoch 3 and declining. One hypothesis: zero-initializing
+  `TransformNet.output_proj` starts training at the identity transform, making the state a
+  frozen constant so all early gradient flows through the token path. Untested.
+- **Extend the effective horizon beyond ~19 tokens.** The learned `a ≈ 0.71` forgets fast;
+  structured initializations (HiPPO and successors) exist precisely to address this.
 
 **Near-term**:
 - Hierarchical GSM with multiple timescales
@@ -295,15 +342,18 @@ The Geometric State Machine *proposes* that the storage-based assumption underly
 
 What the work does establish:
 - **O(1) per token** in both memory and compute — a real property of the architecture, independent of how well it learns
-- **Architecturally novel** — the input-parameterized subspace rotations have no precedent we are aware of in the sequence modeling literature
 - **Practically efficient to train** — 32M parameters, consumer GPU, under an hour on this corpus
+- **The recurrence parallelizes exactly.** Written as an affine map, it admits an associative scan resolving in O(log T) depth, verified exact to 5.1e-13 in float64 at T=512. This paper's §7 claim that the sequential dependency is irreducible is wrong.
 
 What remains unestablished:
-- That the geometry accumulates context. Measured horizon: ~19 tokens, with the state ablatable at 99.2% output agreement.
+- That the geometry accumulates context. Measured horizon: ~19 tokens.
+- That subspace rotation contributes anything. Ablation: 100% identical predictions.
 - That the model generalizes at all. No held-out evaluation has been run.
-- That the interpretability, continual-learning, and infinite-context applications follow. Each assumes a state that carries information, which has not been observed.
+- That the interpretability, continual-learning, and infinite-context applications follow. Each assumes a state carrying long-range information, which has not been observed.
 
-The honest summary is that the architecture is novel and cheap, and its central hypothesis is still untested — the one experiment run so far came back negative, on a setup (32M parameters, 1,535 sequences, no validation split, no early stopping) that makes memorization the expected outcome for almost any architecture.
+**Revised positioning.** With rotation inert and the horizon at ~19 tokens, GSM as measured is a selective diagonal linear recurrence — the same core operation as Mamba — without HiPPO initialization or eigenspectrum design, wrapped in geometric language. That is a narrower and more familiar claim than this paper makes, and it suggests the productive direction is not defending the geometric framing but fixing the two concrete defects measurement identified: rotation covering 6.2% of dimensions, and cumulative angle wrapping ~10 times.
+
+The honest summary: the architecture is cheap and parallelizes well, its distinctive component does nothing in the one trained model examined, and its central hypothesis remains untested — the single experiment run came back negative on a setup (32M parameters, 1,535 sequences, no validation split, no early stopping) where memorization is the expected outcome for almost any architecture.
 
 This was built in a single afternoon. The Bach it generates after 47 epochs of training is not the ceiling. It is the floor.
 

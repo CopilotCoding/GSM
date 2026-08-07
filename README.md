@@ -29,27 +29,43 @@ Separating what has been measured from what is asserted. Every claim below is re
 | Previous claim | What measurement shows |
 | -------------- | ---------------------- |
 | "Generates convincing baroque piano music" | Generated samples are **60–96% verbatim copies** of single training pieces (`check_memorization.py`, 8/8 samples flagged across two independent generation paths) |
-| "Knowledge is shaped into the geometry" | Zeroing the state mid-sequence changes **0.8%** of subsequent predictions. The state is nearly decorative in the trained model. |
-| "Accumulates context geometrically" / O(1) long-range memory | Effective memory horizon is **~19 tokens**. The learned multiplier drives the state's own history to `e^-358` over 512 tokens — it is a short-window model, not a long-context one. |
+| "Knowledge is shaped into the geometry" | The state is a **leaky integrator over ~19 tokens**, not an accumulated manifold position. Zeroing it changes 0.8% of later predictions — it rebuilds within ~19 steps. |
+| "Accumulates context geometrically" / long-range memory | Predictions match full-history at a **32-token** truncated context (100% agreement; 85% at 16, 65% at 8). It is a short-window model. |
+| **Subspace rotation is the novel core** | **Removing rotation entirely changes 0.00% of predictions.** It touches 128 pairs = 6.2% of 4096 dims, and cumulative angle reaches ~63 rad (≈10 full turns). The decoder learned to ignore those dimensions. |
 | "Geometric bias prevents memorization on small data" | The opposite was observed on exactly the dataset used to support the claim. |
 | "GSM learns effectively from very small datasets" | It memorized 202 files. Whether it *learns* from them is untested. |
 
+### Correction to an earlier version of this section
+
+A previous revision stated the state "decays to `e^-358`" and was therefore "decorative." **That was wrong**, and the error is worth recording: `e^-358` is the decay of `S₀`'s contribution — the *initial condition* — not of the state. The shift term `b` reinjects signal every step, so `|S|` stays around 0.1 for all 512 tokens. The state is real and carries information; it just only carries the recent past. Measuring decay of the initial condition and reporting it as decay of the state conflated two different quantities.
+
+### What the model actually is
+
+With rotation contributing nothing and the state's horizon at ~19 tokens, stripping the geometric framing leaves:
+
+> a 6-layer MLP mapping each token to `scale`/`shift`/`gate`, composed into a **leaky-integrator running average** (`S ← a⊙S + b`, `a ≈ 0.71`) over roughly the last 19 tokens, decoded by a 3-layer MLP.
+
+That is a gated linear RNN with diagonal transitions — structurally close to a simplified Mamba/RWKV minus the selective mechanism, plus a rotation that measurement shows is inert. The leaky integrator is a legitimate architecture. The parts that made GSM *novel* — the manifold framing and the subspace rotations — are the parts that do nothing here.
+
 ### Not yet tested
 
-Generalization of any kind. There is **no held-out validation split** in `train.py`, so every loss number in this README is training loss and none of them measure learning. Whether the architecture can generalize when trained with early stopping, more data, or regularization is genuinely open — the memorization result is evidence about this training run, not proof the approach cannot work.
+Generalization of any kind. There is **no held-out validation split** in `train.py`, so every loss number in this README is training loss and none of them measure learning. An n-gram baseline comparison was attempted and is **unusable**: the "held-out" files were in GSM's training set. (The 4-gram baseline itself, 40.8% held-out next-token accuracy, is valid; GSM's 96.3% is memorization, not skill.)
+
+Whether the architecture can generalize with early stopping, more data, or regularization is genuinely open. These results describe one training run, not a proof the approach cannot work.
 
 Reproduce with:
 
 ```cmd
 python check_memorization.py                        # copying vs. training data
+python probe_state.py                               # is the state used?
 python capture_live.py && python check_memorization.py --generated generated_live
 ```
 
-⚠️ **This architecture has not been shown to work.** A trained checkpoint (loss 0.0121, 70 epochs on 228 Bach files) was measured and found to **reproduce training data verbatim** — generated samples are 60–96% contiguous copies of single training pieces. Worse, ablation shows the geometric state is **not carrying information**: zeroing it mid-sequence changes 0.8% of subsequent predictions, and its effective memory horizon is ~19 tokens. See [What Is Actually Verified](#what-is-actually-verified).
+⚠️ **This architecture has not been shown to work as described.** A trained checkpoint (loss 0.0121, 70 epochs on 228 Bach files) reproduces training data verbatim, uses only ~19 tokens of context, and is bit-identical in its predictions with the subspace rotations removed.
 
-What *is* verified is the scan reformulation itself: it is algebraically exact (5.1e-13 in float64 at T=512), trains ~6× faster than the sequential version, and is numerically stable without gradient clipping. Those are claims about the *implementation*, not about the architecture learning anything.
+What *is* verified is the scan reformulation: algebraically exact (5.1e-13 in float64 at T=512), ~6× faster training, numerically stable without gradient clipping. Those are claims about the *implementation*, not about the architecture learning anything.
 
-The Bach results this README previously led with — 54 minutes, loss 0.1196, "convincing baroque piano music" — came from the older sequential recurrence and were never tested for memorization. Given that the current model memorizes on the same corpus, **those results should be assumed to reflect copying as well** until someone checks. They are preserved in [Results](#results) as a historical record only.
+The Bach results this README previously led with — 54 minutes, loss 0.1196, "convincing baroque piano music" — came from the older sequential recurrence and were never tested for memorization. Given that the current model memorizes on the same corpus, **those results should be assumed to reflect copying as well** until someone checks. Preserved in [Results](#results) as a historical record only.
 
 ---
 
@@ -83,7 +99,11 @@ In a space with 4096 dimensions, there is an enormous amount of room to encode s
 
 The idea is to not store the music, but let the music reshape a geometry, and trust that geometry to remember what matters.
 
-**Whether it does is a separate question, and so far the answer is no.** In the trained model measured here, the ball's position stops mattering after about 19 notes — you can pick it up and move it somewhere completely different mid-piece and the model carries on as if nothing happened. It turned out to be predicting mostly from the last few notes and reciting pieces it had seen. The architecture permits the behavior described above; it does not compel it, and nothing has yet made it happen.
+**Whether it does is a separate question, and so far the answer is no.** In the trained model measured here, the ball only remembers about the last 19 notes. Each note nudges it, and each nudge fades to nothing within roughly 19 more notes — so it works like a running average of the recent past, not an accumulation of the whole piece. You can pick the ball up and move it somewhere completely different mid-piece, and within 19 notes the model has recovered and carries on as if nothing happened.
+
+The twisting — the rotation, the part that made this design unlike anything else — turned out to do **literally nothing**. Switch it off entirely and the model produces the exact same notes. It only ever twisted 6% of the dimensions, and it twisted them so far (about ten full turns by the end of a piece) that the result was scrambled noise the rest of the model learned to ignore.
+
+So what remained was a short-memory model with a very large memory of *pieces*, reciting what it had seen. The architecture permits the behavior described above; it does not compel it, and nothing has yet made it happen.
 
 **The compute property is real and unaffected:** each note takes the same amount of compute, and the ball stays the same size regardless of how long the piece is. No growing list, no quadratic blowup. That much holds regardless of how well the model learns.
 
@@ -125,6 +145,8 @@ All pairs are computed in parallel via gather/scatter. This is a sparse approxim
 
 GSM has no autonomous dynamics at all. The entire transformation — including what would correspond to `A` — is a function of the input. This is a stronger form of input-conditioning and removes the need for eigenspectrum engineering, but it also means the model can't learn input-independent temporal dynamics. Whether that's a limitation or a feature depends on the domain.
 
+**In practice the similarity turned out to be much less shallow than claimed.** With the scan reformulation, the recurrence *is* `S ← a⊙S + b` with input-dependent diagonal `a` — a selective diagonal linear recurrence, which is precisely Mamba's core operation. Since measurement shows the rotation contributes nothing, what remains is a diagonal SSM whose transition is input-conditioned, without HiPPO initialization or a principled eigenspectrum. The learned `a ≈ 0.71` gives an effective horizon of ~19 tokens, where structured SSM initializations exist specifically to avoid that kind of fast forgetting. The honest positioning is "a diagonal selective SSM that omits the initialization theory," not "a fundamentally different paradigm."
+
 **Relation to GRUs.** The gate mechanism `S' = gate ⊙ S_new + (1 - gate) ⊙ S` is structurally identical to a GRU update gate, and the shift/scale is analogous to the candidate hidden state. The difference is that a GRU computes its candidate via `tanh(W_h · (r ⊙ h) + W_x · x)` — a fixed recurrent projection `W_h` applied to the gated previous state. GSM replaces this entirely: there is no `W_h`, and the candidate state is produced by a geometric operation (rotation in random subspaces) rather than a linear projection. The inductive bias shifts from "linear memory compression" to "isometric geometric deformation."
 
 **Parallelization.** Two independent facts combine here. First, TransformNet — the dominant compute cost — has no dependency on `S`, so all `T` calls batch into a single `[B·T, d]` matmul. Second, and this is the part that used to be missing, the state recurrence itself is no longer sequential: with the update written as an affine map, composition is associative and the whole sequence resolves by parallel scan in O(log T) depth. There is no Python loop over time in the forward pass at all.
@@ -133,9 +155,26 @@ The earlier claim that the recurrence was "irreducibly sequential" was wrong —
 
 **Small datasets — a hypothesis that failed its first test.** The argument was: subspace rotations are a highly constrained family of transformations, so the model can't implement arbitrary state transitions, only isometric deformations followed by gated mixing. On a small corpus this constraint should act as an implicit regularizer preventing the memorization a less constrained model would fall into.
 
-Measurement contradicts this. On 228 Bach files the model memorized thoroughly — 60–96% verbatim reproduction — and did it *by routing around the geometry*: the learned gate drives the state's contribution to `e^-358` over 512 tokens, reducing the model to a short-window token map with a 32M-parameter lookup behind it. The rotation constraint doesn't bind, because the model isn't relying on the state at all.
+Measurement contradicts this. On 228 Bach files the model memorized thoroughly — 60–96% verbatim reproduction. The rotation constraint never bound, for two independent reasons: rotation touches only 6.2% of state dimensions and ablates to no effect at all, and the state's own horizon is ~19 tokens, so the model is effectively a short-window token map with 32M parameters of lookup behind it. A constraint on an unused component cannot regularize anything.
 
 The flaw in the original argument is that it constrains *how the state evolves* while saying nothing about capacity. The state is a pointer, not the store; 32M parameters in TransformNet are where a corpus this size actually fits. A fixed-size state bounds how much context can be live at once — not how much the model can memorize. Those are independent quantities, and this README previously conflated them.
+
+**The state was never used, at any point in training.** Probing checkpoints across the run:
+
+| Epoch | Loss | gate | Horizon | Zeroing S changes | Copying |
+| ----- | ---- | ---- | ------- | ----------------- | ------- |
+| 1 | 3.7235 | 0.548 | 30 tok | 1.6% | — |
+| 3 | 1.6455 | 0.507 | 34 tok | 6.7% | 11.0% |
+| 10 | 0.8262 | 0.433 | 27 tok | 3.5% | 5.2% |
+| 20 | 0.3188 | 0.396 | 22 tok | 0.8% | 6.0% |
+| 30 | 0.0871 | 0.390 | 21 tok | 1.2% | 18.3% |
+| 70 | 0.0121 | 0.389 | 19 tok | 0.8% | **63.4%** |
+
+There is no collapse to find — state usage peaks around 7% at epoch 3 and drifts down. Copying is a *separate, later* phenomenon that tracks loss, not state usage, and only explodes after epoch 30.
+
+**A likely cause is the initialization.** `TransformNet.output_proj` is zero-initialized so training starts at the identity transform (`a ≡ 1`, `b ≡ 0`, `gate = 0.5`). At that point the state is a frozen constant contributing nothing, so *every* early gradient comes through the token-conditioned path. By the time the state could become useful, the token path already explains most of the loss. The zero-init that guarantees a stable start also makes state-independence the path of least resistance. This is a hypothesis suggested by the sweep, not a tested claim.
+
+**The usable window is roughly epochs 10–30**: 40–60% novel 8-grams with modest copying. `epoch_010_loss0.8262.pt` is the best available checkpoint at 5.2% copying — not a good model, but not a lookup table. (3 samples per epoch; the epoch-30 uptick could be noise.)
 
 **Open questions.** Whether the random fixed subspace pairs are the right structure — versus learned pairs, full dense rotations, or a hierarchical decomposition — is unexplored. The initialization of `S_0` as a learned parameter rather than zero or a fixed point is also non-obvious; it means the model learns a "prior geometric position" that all sequences start from.
 
@@ -197,9 +236,22 @@ A 6-layer MLP with residual connections that maps a token embedding to transform
 
 ### RotarySubspaceTransform
 
-The geometrically novel component. A fixed set of random dimension pairs `(i, j)` in R^N. For each pair, the model produces a rotation angle and applies a 2D rotation in that subspace. All pairs computed simultaneously via indexing — no Python loops, fully vectorized on GPU.
+The geometrically novel component, and **the one measurement shows is doing nothing.**
 
-There is no classical sequence model operation that corresponds to input-parameterized subspace rotations on a fixed geometric object.
+A fixed set of random dimension pairs `(i, j)` in R^N. For each pair, the model produces a rotation angle and applies a 2D rotation in that subspace. All pairs computed simultaneously via indexing — no Python loops, fully vectorized on GPU.
+
+There is no classical sequence model operation that corresponds to input-parameterized subspace rotations on a fixed geometric object. That novelty is real. Its contribution to this model is not:
+
+```
+rotation ON vs OFF, 512 tokens:  100.00% identical predictions
+```
+
+Two structural reasons, both fixable:
+
+* **Coverage.** `n_pairs=128` rotates 256 of 4096 dimensions — **6.2%** of the state. The other 93.8% never rotate. Scaling `n_pairs` toward `state_dim / 2` would make rotation act on the whole state.
+* **Angle wrap.** Angles accumulate additively with no bound, reaching **~63 radians** (≈10 full revolutions) by t=512. At that magnitude the rotation is an arbitrary scramble of those dimensions, uncorrelated with anything, so the decoder learns to ignore them. Bounding cumulative angle — or applying rotation per-step rather than cumulatively — would keep it in an informative range.
+
+The logits are not bit-identical (max difference 9.03), so rotation is not mathematically inert. The decoder simply routed around it. Anyone continuing this work should treat these two fixes as the first experiment, not the geometric framing as settled.
 
 ---
 
