@@ -3,14 +3,49 @@ GSM — Geometric State Machine
 ==============================
 Fixed-geometry state manifold architecture.
 Each token is a transformation operator acting on a point in R^N.
-O(1) per token: fixed compute, fixed state size, scales to any corpus.
+Fixed compute per token, fixed state size, scales to any corpus.
 
-v2 improvements:
-- Deeper TransformNet (6 layers instead of 3)
-- Larger default state_dim (4096)
-- Larger default embed_dim (512)
-- Residual connections in TransformNet for gradient flow
+Parallel associative scan
+-------------------------
+The recurrence is expressed as an associative operator so the whole sequence
+resolves in O(log T) depth instead of a T-step Python loop.
+
+Each token contributes an affine map on the state, `S -> a * S + b`, with the
+gate folded into the affine part:
+
+    a = gate * scale + (1 - gate)
+    b = gate * shift
+
+Two such maps compose as
+
+    (a2, b2) o (a1, b1) = (a2 * a1,  a2 * b1 + b2)
+
+which is associative, so a Hillis-Steele scan applies. Rotations are
+norm-preserving and compose additively in angle within each 2-D subspace, so
+the cumulative rotation at step t is the prefix sum of angles and is applied
+once after the affine scan resolves.
+
+Stability comes from geometry rather than clipping: rotation preserves length,
+and the affine part is non-expanding by construction. `scale` is bounded to
+(0, 1) so that `a` is a convex combination of `scale` and 1 and therefore lies
+in (0, 1] -- the composed multiplier over any span is a product of terms <= 1
+and cannot grow. This bound is load-bearing: dropping the per-step LayerNorm is
+what buys associativity, and without it a scale range of (0, 2) compounds
+multiplicatively and overflows fp32 within a few hundred tokens.
+
+This is a different recurrence from the earlier sequential GSM, which applied
+LayerNorm inside the loop and interleaved rotation with each affine step.
+Neither is associative, so neither could be scanned.
+
+WARNING: checkpoints trained under that sequential recurrence have identical
+parameter shapes, so `load_state_dict` accepts them without complaint, but they
+were trained under different dynamics and will not reproduce their old outputs.
+Nothing in a checkpoint marks which recurrence produced it -- if a loaded model
+behaves badly for no visible reason, this is the first thing to check. Retrain
+rather than trying to port.
 """
+
+import math
 
 import torch
 import torch.nn as nn
@@ -19,35 +54,37 @@ import torch.nn.functional as F
 
 class RotarySubspaceTransform(nn.Module):
     """
-    Vectorized subspace rotations. All pairs computed in parallel.
+    Vectorized rotations of `n_pairs` disjoint 2-D subspaces.
+    Norm-preserving by construction. Operates on any leading batch shape.
     """
     def __init__(self, state_dim: int, n_pairs: int = 128):
         super().__init__()
         self.state_dim = state_dim
         self.n_pairs = n_pairs
         idx = torch.randperm(state_dim)[:n_pairs * 2].reshape(n_pairs, 2)
-        self.register_buffer("idx_a", idx[:, 0])
-        self.register_buffer("idx_b", idx[:, 1])
+        self.register_buffer("idx_a", idx[:, 0].contiguous())
+        self.register_buffer("idx_b", idx[:, 1].contiguous())
 
     def forward(self, S: torch.Tensor, angles: torch.Tensor) -> torch.Tensor:
         cos_t = torch.cos(angles)
         sin_t = torch.sin(angles)
-        a = S[:, self.idx_a]
-        b = S[:, self.idx_b]
+        a = S[..., self.idx_a]
+        b = S[..., self.idx_b]
         new_a = cos_t * a - sin_t * b
         new_b = sin_t * a + cos_t * b
-        # Clone once, then use indexing assignment (cleaner than scatter_ + expand)
         S_new = S.clone()
-        S_new[:, self.idx_a] = new_a
-        S_new[:, self.idx_b] = new_b
+        S_new[..., self.idx_a] = new_a
+        S_new[..., self.idx_b] = new_b
         return S_new
 
 
 class TransformNet(nn.Module):
     """
     Maps token embeddings to transformation parameters.
-    6-layer deep MLP with residual connections for gradient flow.
+    Deep MLP with residual connections for gradient flow.
     Produces: scale, shift, gate (state_dim each), angles (n_pairs).
+
+    Accepts any leading batch shape, so it can be called on [B, T, E] directly.
     """
     def __init__(self, embed_dim: int, state_dim: int, n_pairs: int, hidden_dim: int = 1024, n_layers: int = 6):
         super().__init__()
@@ -88,16 +125,35 @@ class TransformNet(nn.Module):
             x = norm(x + res_layer(x))
 
         out = self.output_proj(x)
-        scale  = torch.sigmoid(out[:, :self.state_dim]) * 2.0
-        shift  = out[:, self.state_dim:self.state_dim * 2] * 0.1
-        gate   = torch.sigmoid(out[:, self.state_dim * 2:self.state_dim * 3])
-        angles = out[:, self.state_dim * 3:] * 0.1
+        d = self.state_dim
+        # scale is bounded to (0, 1), NOT (0, 2) as in the earlier sequential
+        # GSM. There, an in-loop LayerNorm renormalized the state every step,
+        # so scale > 1 could not compound. The scan has no per-step norm --
+        # that is precisely what makes it associative -- so the affine
+        # multiplier composes multiplicatively across the whole sequence.
+        # With scale < 1 the folded multiplier a = gate*scale + (1-gate) is a
+        # convex combination of scale and 1, hence in (0, 1]: the cumulative
+        # product is non-expanding and the state cannot blow up. Allowing
+        # scale up to 2 overflows fp32 within a few hundred tokens.
+        scale  = torch.sigmoid(out[..., :d])
+        shift  = out[..., d:d * 2] * 0.1
+        gate   = torch.sigmoid(out[..., d * 2:d * 3])
+        angles = out[..., d * 3:] * 0.1
         return scale, shift, gate, angles
 
 
 class GeometricStateStep(nn.Module):
     """
-    Single O(1) step: S' = gate * Rotate(scale * S + shift) + (1 - gate) * S
+    The scan-form state update, in both parallel and incremental flavours.
+
+    Per token the state map is the affine operator
+
+        S -> a * S + b,   a = gate * scale + (1 - gate),  b = gate * shift
+
+    followed, once the affine part has resolved, by a rotation through the
+    accumulated angle. `scan` applies this to a whole sequence in O(log T)
+    depth; `step` advances a single token for generation using exactly the same
+    math, so sampling matches training.
     """
     def __init__(self, embed_dim: int, state_dim: int, n_pairs: int, hidden_dim: int = 1024, n_layers: int = 6):
         super().__init__()
@@ -105,18 +161,72 @@ class GeometricStateStep(nn.Module):
         self.rotary = RotarySubspaceTransform(state_dim, n_pairs)
         self.norm = nn.LayerNorm(state_dim)
 
-    def forward(self, S: torch.Tensor, e: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def _affine(scale, shift, gate):
+        """Fold scale/shift/gate into a single affine operator (a, b)."""
+        a = gate * scale + (1.0 - gate)
+        b = gate * shift
+        return a, b
+
+    def scan(self, E: torch.Tensor, S0: torch.Tensor) -> torch.Tensor:
+        """
+        Resolve a whole sequence. E: [B, T, embed_dim], S0: [state_dim].
+        Returns normalized states [B, T, state_dim].
+        """
+        scale, shift, gate, angles = self.transform_net(E)
+        a, b = self._affine(scale, shift, gate)
+
+        batch, seq_len, state_dim = a.shape
+
+        # Hillis-Steele inclusive scan over the affine operators. Each round
+        # composes every element with the one `sh` positions back; identity
+        # (a=1, b=0) pads the front so early positions compose with a no-op.
+        steps = math.ceil(math.log2(seq_len)) if seq_len > 1 else 0
+        for i in range(steps):
+            sh = 1 << i
+            a_prev = F.pad(a[:, :-sh], (0, 0, sh, 0), value=1.0)
+            b_prev = F.pad(b[:, :-sh], (0, 0, sh, 0), value=0.0)
+            b = a * b_prev + b
+            a = a * a_prev
+
+        states = a * S0.view(1, 1, -1) + b
+        # Rotation composes additively in angle -> prefix sum.
+        states = self.rotary(states, torch.cumsum(angles, dim=1))
+        return self.norm(states)
+
+    def step(self, carry: tuple, e: torch.Tensor) -> tuple:
+        """
+        Advance one token, scan-consistent.
+
+        `carry` is (S_raw, angle_acc): the *pre-rotation, pre-norm* state and
+        the accumulated rotation angle. Keeping the raw state is what makes
+        this match the scan -- rotation and normalization are applied to a
+        snapshot for readout, never fed back into the recurrence.
+
+        Returns (new_carry, S_out) where S_out is the normalized readout state.
+        """
+        S_raw, angle_acc = carry
         scale, shift, gate, angles = self.transform_net(e)
-        S_t = scale * S + shift
-        S_t = self.rotary(S_t, angles)
-        S_new = gate * S_t + (1.0 - gate) * S
-        return self.norm(S_new)
+        a, b = self._affine(scale, shift, gate)
+
+        S_raw = a * S_raw + b
+        angle_acc = angle_acc + angles
+
+        S_out = self.norm(self.rotary(S_raw, angle_acc))
+        return (S_raw, angle_acc), S_out
+
+    def init_carry(self, S0: torch.Tensor, batch: int) -> tuple:
+        """Fresh carry for `step`: raw state at S0, zero accumulated angle."""
+        S_raw = S0.unsqueeze(0).expand(batch, -1).contiguous()
+        angle_acc = torch.zeros(batch, self.rotary.n_pairs,
+                                device=S0.device, dtype=S0.dtype)
+        return (S_raw, angle_acc)
 
 
 class GSM(nn.Module):
     """
     Geometric State Machine.
-    S ∈ R^N fixed-size manifold point, updated O(1) per token.
+    S ∈ R^N fixed-size manifold point, resolved by parallel associative scan.
     """
     def __init__(self, vocab_size: int, embed_dim: int = 512,
                  state_dim: int = 4096, n_pairs: int = 128,
@@ -150,54 +260,10 @@ class GSM(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    @torch.compiler.disable
-    def _forward_train(self, S, E, batch, seq_len):
-        """
-        Training forward: run TransformNet step-by-step alongside the recurrence.
-        The batched [batch*seq_len] approach is faster for inference (no grad) but
-        slower for training because the large output tensor creates excess memory
-        bandwidth pressure during backward. Per-step here keeps tensors small.
-        """
-        states = torch.empty(batch, seq_len, self.state_dim,
-                             device=S.device, dtype=S.dtype)
-        for t in range(seq_len):
-            S = self.step(S, E[:, t, :])
-            states[:, t] = S
-        return states
-
-    @torch.compiler.disable
-    def _forward_inference(self, S, E, batch, seq_len):
-        """
-        Inference forward: batch all TransformNet calls across time in one matmul,
-        then run the cheap recurrence. 2-3x faster with no grad.
-        """
-        E_flat = E.reshape(batch * seq_len, self.embed_dim)
-        scale_f, shift_f, gate_f, angles_f = self.step.transform_net(E_flat)
-        scale  = scale_f.view(batch, seq_len, self.state_dim)
-        shift  = shift_f.view(batch, seq_len, self.state_dim)
-        gate   = gate_f.view(batch, seq_len, self.state_dim)
-        angles = angles_f.view(batch, seq_len, self.step.rotary.n_pairs)
-        states = torch.empty(batch, seq_len, self.state_dim,
-                             device=S.device, dtype=S.dtype)
-        for t in range(seq_len):
-            S_t = self.step.rotary(scale[:, t] * S + shift[:, t], angles[:, t])
-            S   = gate[:, t] * S_t + (1.0 - gate[:, t]) * S
-            S   = self.step.norm(S)
-            states[:, t] = S
-        return states
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch, seq_len = x.shape
-        S = self.S0.unsqueeze(0).expand(batch, -1).clone()
         E = self.embed_drop(self.embedding(x))
-
-        if self.training:
-            # Per-step TransformNet: smaller tensors, faster backward
-            states = self._forward_train(S, E, batch, seq_len)
-        else:
-            # Batched TransformNet: one big matmul, 2-3x faster inference
-            states = self._forward_inference(S, E, batch, seq_len)
-
+        states = self.step.scan(E, self.S0)
         return self.decoder(states.view(batch * seq_len, self.state_dim)).view(batch, seq_len, -1)
 
     @torch.no_grad()
@@ -205,22 +271,26 @@ class GSM(nn.Module):
                  temperature: float = 1.0, top_k: int = 50) -> torch.Tensor:
         self.eval()
         batch = prompt.shape[0]
-        S = self.S0.unsqueeze(0).expand(batch, -1).clone()
 
+        # Ingest the prompt with one scan, then hand off to the incremental
+        # step. The scan does not expose the raw carry, so replay the prompt's
+        # affine composition directly -- same operators, same order.
+        carry = self.step.init_carry(self.S0, batch)
         E = self.embedding(prompt)
         for t in range(prompt.shape[1]):
-            S = self.step(S, E[:, t, :])
+            carry, S_out = self.step.step(carry, E[:, t, :])
 
         generated = prompt.clone()
         for _ in range(max_new_tokens):
-            e = self.embedding(generated[:, -1:]).squeeze(1)
-            S = self.step(S, e)
-            logits = self.decoder(S) / temperature
+            logits = self.decoder(S_out) / temperature
             if top_k > 0:
                 top_vals, _ = torch.topk(logits, top_k)
                 logits[logits < top_vals[:, -1:]] = float('-inf')
             next_token = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)
             generated = torch.cat([generated, next_token], dim=1)
+
+            e = self.embedding(next_token).squeeze(1)
+            carry, S_out = self.step.step(carry, e)
 
         return generated
 

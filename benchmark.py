@@ -169,8 +169,8 @@ def bench_latency(model, config, device, n_tokens=200, n_runs=50):
         with torch.no_grad():
             emb = model.embedding(token).squeeze(1)
             # single step through the model
-            S = model.S0.unsqueeze(0).clone()
-            S = model.step(S, emb)
+            carry = model.step.init_carry(model.S0, 1)
+            _, S = model.step.step(carry, emb)
             _ = model.decoder(S)
         if torch.cuda.is_available():
             torch.cuda.synchronize()

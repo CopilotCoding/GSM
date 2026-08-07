@@ -1,9 +1,0 @@
-{
-  "vocab_size": 373,
-  "embed_dim": 512,
-  "state_dim": 4096,
-  "n_pairs": 128,
-  "hidden_dim": 1024,
-  "n_layers": 6,
-  "dropout": 0.1
-}
